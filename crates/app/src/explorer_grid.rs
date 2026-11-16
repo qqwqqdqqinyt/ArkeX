@@ -441,7 +441,8 @@ mod tests {
         // A short name leaves blank space under it in a tall row.
         let short = grid.tile_bounds(0).expect("tile");
         assert_eq!(grid.hit(point(short.left() + px(4.), short.bottom() + px(2.))), None);
-        assert_eq!(grid.hits_in(px(0.), px(449.), px(0.), px(1.)), vec![0, 1, 2, 3]);
+        let row0 = short.top();
+        assert_eq!(grid.hits_in(px(0.), px(449.), row0, row0 + px(1.)), vec![0, 1, 2, 3]);
         assert_eq!(grid.step(1, 1), 5);
         assert_eq!(grid.step(2, 1), 5);
     }

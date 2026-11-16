@@ -1520,8 +1520,8 @@ impl Workspace {
             ),
             super::uninstall_page::uninstall_card(cx),
         ];
-        // Theme and colors first (material is Windows 11 only); the last five are layout.
-        let layout = appearance.split_off(appearance.len() - 5);
+        // Theme and colors first (material is Windows 11 only); the last six are layout.
+        let layout = appearance.split_off(appearance.len() - 6);
         let appearance = vec![
             group(Some(t!("settings.group_colors")), appearance),
             group(Some(t!("settings.group_layout")), layout),
@@ -1529,21 +1529,21 @@ impl Workspace {
         let mut files = regroup(
             files,
             &[
-                (Some(t!("settings.group_show")), &[0, 2, 1, 5, 6, 7, 8]),
+                (Some(t!("settings.group_show")), &[0, 2, 1, 5, 6, 7, 8, 9, 10]),
                 (
                     Some(t!("settings.group_behavior")),
-                    &[4, 3, 11, 12, 13, 14, 15],
+                    &[4, 3, 13, 14, 15, 16, 17],
                 ),
-                (Some(t!("settings.group_confirm")), &[9, 10]),
+                (Some(t!("settings.group_confirm")), &[11, 12]),
             ],
         );
         files.push(group(Some(t!("settings.group_file_ops")), file_ops_rows(s)));
         let sorting = regroup(
             sorting,
             &[
-                (Some(t!("settings.group_new_tabs")), &[3, 4, 5, 8]),
-                (Some(t!("settings.group_folder_views")), &[9]),
-                (Some(t!("settings.group_details")), &[0, 1, 2, 6, 7]),
+                (Some(t!("settings.group_new_tabs")), &[3, 4, 5, 6, 9]),
+                (Some(t!("settings.group_folder_views")), &[10]),
+                (Some(t!("settings.group_details")), &[0, 1, 2, 7, 8]),
             ],
         );
         let startup = regroup(startup, &[(None, &[3, 4, 5, 6, 7, 0, 1, 2])]);

@@ -355,9 +355,9 @@ mod tests {
         use IconSize as S;
         use ZoomTarget as Z;
         let icons = ViewMode::Icons;
-        assert_eq!(zoom(icons, S::LARGE, 1), Some(Z::Icons(S::from_px(104.))));
-        assert_eq!(zoom(icons, S::LARGE, -1), Some(Z::Icons(S::from_px(76.))));
-        assert_eq!(zoom(icons, S::MEDIUM, -2), Some(Z::Icons(S::SMALL)));
+        assert_eq!(zoom(icons, S::LARGE, 1), Some(Z::Icons(S::from_px(96.))));
+        assert_eq!(zoom(icons, S::LARGE, -1), Some(Z::Icons(S::from_px(80.))));
+        assert_eq!(zoom(icons, S::MEDIUM, -1), Some(Z::Icons(S::SMALL)));
         assert_eq!(zoom(icons, S::SMALL, -1), Some(Z::Details));
         assert_eq!(zoom(icons, S::EXTRA_LARGE, 1), None, "largest already");
         assert_eq!(zoom(icons, S::LARGE, -9), Some(Z::Details), "clamped");
@@ -365,12 +365,12 @@ mod tests {
         assert_eq!(zoom(icons, S::MEDIUM, 0), None);
         // A slider size between stops goes to the next stop either way.
         let between = S::from_px(92.);
-        assert_eq!(zoom(icons, between, 1), Some(Z::Icons(S::from_px(104.))));
-        assert_eq!(zoom(icons, between, -1), Some(Z::Icons(S::LARGE)));
+        assert_eq!(zoom(icons, between, 1), Some(Z::Icons(S::from_px(96.))));
+        assert_eq!(zoom(icons, between, -1), Some(Z::Icons(S::from_px(80.))));
         let details = ViewMode::Details;
         assert_eq!(zoom(details, S::EXTRA_LARGE, 1), Some(Z::Icons(S::SMALL)));
         assert_eq!(zoom(details, S::LARGE, -1), None, "Details is the smallest");
-        assert_eq!(zoom(details, S::LARGE, 3), Some(Z::Icons(S::MEDIUM)));
+        assert_eq!(zoom(details, S::LARGE, 2), Some(Z::Icons(S::MEDIUM)));
         assert_eq!(zoom(ViewMode::Columns, S::LARGE, 1), None);
     }
 

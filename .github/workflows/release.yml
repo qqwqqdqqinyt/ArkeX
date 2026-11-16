@@ -113,6 +113,6 @@ jobs:
           CHANNEL: stable
           NUMBER: ""
         run: |
-          args=("$CHANNEL")
+          args=("$CHANNEL" --arch x64)
           if [ -n "$NUMBER" ]; then args+=(--number "$NUMBER"); fi
           cargo xtask publish "${args[@]}" --prebuilt
