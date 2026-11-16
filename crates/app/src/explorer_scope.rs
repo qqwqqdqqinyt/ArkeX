@@ -227,11 +227,45 @@ impl Explorer {
         }
     }
 
+    /// Where typing searches: "this folder" when picked (or with Settings → Search's subfolder
+    /// option off), otherwise its subfolders too.
+    pub(crate) fn typing_scope(&self) -> Scope {
+        if self.here_pinned {
+            Scope::Here
+        } else if self.subfolders_picked || crate::prefs::search_subfolders() {
+            Scope::Subfolders
+        } else {
+            Scope::Here
+        }
+    }
+
+    /// The scope the panel and chip show: the running search's, or before one starts, where
+    /// typing will search.
+    pub(crate) fn shown_scope(&self) -> Scope {
+        if self.search_mode {
+            self.scope()
+        } else {
+            self.typing_scope()
+        }
+    }
+
     /// The user picked a scope in the panel: "this folder" stays put while typing (otherwise
-    /// typing searches subfolders, see [`Explorer::on_query_changed`]).
+    /// typing searches subfolders, see [`Explorer::on_query_changed`]). "Subfolders" with nothing
+    /// typed only remembers the choice: the folder's items stay until a search starts.
     pub(crate) fn pick_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
         self.here_pinned = scope == Scope::Here;
+        self.subfolders_picked = scope == Scope::Subfolders;
+        if scope == Scope::Subfolders && self.search_in.is_none() && self.nothing_to_search() {
+            if self.search_mode {
+                // From "this PC" with nothing typed: back to the folder's own items.
+                self.set_scope(Scope::Here, cx);
+            }
+            self.refresh_placeholders(&rust_i18n::locale(), cx);
+            cx.notify();
+            return;
+        }
         self.set_scope(scope, cx);
+        self.refresh_placeholders(&rust_i18n::locale(), cx);
     }
 
     /// Change scope: keep the typed text and rerun for the new scope.
@@ -322,7 +356,7 @@ impl Explorer {
 
     pub(super) fn bind_scope_actions<E: InteractiveElement>(el: E, cx: &mut Context<Self>) -> E {
         el.on_action(cx.listener(|this, _: &PanelEnter, window, cx| {
-            let at = PanelItem::Scope(this.scope());
+            let at = PanelItem::Scope(this.shown_scope());
             this.focus_panel(at, window, cx);
         }))
         .on_action(cx.listener(|this, _: &PanelEnterLast, window, cx| {
@@ -369,7 +403,7 @@ impl Explorer {
         }
         match at {
             PanelItem::ClearFilters => PanelItem::Filter(Facet::Date),
-            _ => PanelItem::Scope(self.scope()),
+            _ => PanelItem::Scope(self.shown_scope()),
         }
     }
 
@@ -429,7 +463,7 @@ impl Explorer {
                 self.pick_scope(scope, cx);
             }
             // Coming into the scope row from another row: the selected one.
-            (PanelItem::Scope(_), _) => self.panel_cursor = PanelItem::Scope(self.scope()),
+            (PanelItem::Scope(_), _) => self.panel_cursor = PanelItem::Scope(self.shown_scope()),
             _ => self.panel_cursor = next,
         }
         cx.notify();
@@ -800,11 +834,12 @@ impl Explorer {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let scope = self.scope();
-        let here = scope == Scope::Here;
-        if here && !focused {
+        // Unfocused, the chip only shows a running search's scope; focused, where typing goes.
+        if !focused && self.scope() == Scope::Here {
             return None;
         }
+        let scope = self.shown_scope();
+        let here = scope == Scope::Here;
         Some(
             div()
                 .id("scope-chip")
@@ -927,7 +962,7 @@ impl Explorer {
     /// The search panel below the focused box (floats over the content): where to search, what
     /// that scope does (index status for "this PC"), the filters, and a keyboard hint.
     pub(super) fn render_scope_strip(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.scope();
+        let current = self.shown_scope();
         let keyboard = self.panel_focus.is_focused(window);
         let rows = self.panel_rows(cx);
         // The keyboard position, while the panel has focus and no menu is open.

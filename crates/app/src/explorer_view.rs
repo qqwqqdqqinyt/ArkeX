@@ -411,7 +411,7 @@ impl Explorer {
                     .child(segment(
                         "view-details",
                         Icon::ViewList,
-                        self.view_mode == ViewMode::Details,
+                        self.shown_view() == ViewMode::Details,
                         t!("ctx.view_details"),
                         cx.listener(|this, _: &ClickEvent, w, cx| {
                             this.view_details(&ViewDetails, w, cx);
@@ -420,14 +420,14 @@ impl Explorer {
                     .child(segment(
                         "view-icons",
                         Icon::ViewGrid,
-                        self.view_mode == ViewMode::Icons,
+                        self.shown_view() == ViewMode::Icons,
                         self.icon_size.tooltip(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.show_icons(cx)),
                     ))
                     .child(segment(
                         "view-columns",
                         Icon::ViewColumns,
-                        self.view_mode == ViewMode::Columns,
+                        self.shown_view() == ViewMode::Columns,
                         t!("ctx.view_columns"),
                         cx.listener(|this, _: &ClickEvent, w, cx| {
                             this.view_columns(&ViewColumns, w, cx);
@@ -1039,15 +1039,36 @@ impl Explorer {
         let Some(dir) = self.current_path().map(Path::to_path_buf) else {
             return Vec::new();
         };
+        self.file_media_in(&dir, entries, range, thumbnails, extra, cx)
+    }
+
+    /// [`Self::file_media`] for `entries` named relative to `dir` (search hits are named by their
+    /// path below the search root).
+    fn file_media_in(
+        &mut self,
+        dir: &Path,
+        entries: &[Entry],
+        range: Range<usize>,
+        thumbnails: bool,
+        extra: Vec<MediaKey>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Option<Arc<RenderImage>>> {
+        let dir = dir.to_path_buf();
         let allowed = self.media_ok(&dir, cx);
         if !allowed {
             return Vec::new();
         }
         let thumb_px = (thumbnails && self.show_thumbnails).then(|| self.thumbnail_px());
+        // System icons come at the size they're drawn at, so big tiles stay sharp.
+        let icon_px = if thumbnails {
+            self.thumbnail_px()
+        } else {
+            crate::media::LIST_ICON_PX
+        };
         let key = |ix: usize| {
             entries
                 .get(ix)
-                .and_then(|e| MediaKey::sized(&dir, e, thumb_px))
+                .and_then(|e| MediaKey::sized_icons(&dir, e, thumb_px, icon_px))
         };
         let keys: Vec<Option<MediaKey>> = range.clone().map(key).collect();
         let prefetch_end = (range.end + range.len()).min(entries.len());
@@ -1739,7 +1760,124 @@ impl Explorer {
             .collect()
     }
 
+    /// Search results as tiles (Icons view): rows of [`Self::tile`]-sized tiles, names on up to
+    /// two lines, each tile clickable like a result row.
+    fn search_grid_list(&mut self, len: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let measured = self.list_bounds.get().size.width;
+        let avail = if measured > px(0.) {
+            measured - SCROLLBAR_GUTTER
+        } else {
+            self.pane_width - theme::S_8 - theme::S_16 - SCROLLBAR_GUTTER
+        };
+        let cols = grid::Cols::fit(avail, self.tile().w);
+        self.search_cols = cols.n.max(1);
+        let rows = len.div_ceil(self.search_cols);
+        let list = uniform_list(
+            "search-grid",
+            rows,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                this.render_search_tiles(range, cols, focused, cx)
+            }),
+        )
+        .track_scroll(&self.search_scroll)
+        .map(sideways_is_not_down)
+        .pt(grid::TOP)
+        .flex_1();
+        self.with_scrollbar(list, &self.search_scroll)
+    }
+
+    fn render_search_tiles(
+        &mut self,
+        rows: Range<usize>,
+        cols: grid::Cols,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(results) = self.search_results.clone() else {
+            return Vec::new();
+        };
+        let n = self.search_cols.max(1);
+        let start = (rows.start * n).min(results.hits.len());
+        let end = (rows.end * n).min(results.hits.len());
+        // Hits named by their path below the root, so media keys find the files.
+        let entries: Vec<Entry> = results.hits[start..end]
+            .iter()
+            .map(|hit| {
+                let mut e = hit.entry.clone();
+                e.name = Arc::clone(&hit.rel);
+                e
+            })
+            .collect();
+        let images = {
+            let images = self.file_media_in(&results.root, &entries, 0..entries.len(), true, Vec::new(), cx);
+            let large = self.tile().icon > px(32.);
+            self.with_type_icons(&entries, 0..entries.len(), images, large, cx)
+        };
+        let tile = self.tile();
+        let height = grid::tile_height(tile, 2);
+        let cursor = self.search_cursor;
+        rows.map(|row| {
+            let tiles: Vec<AnyElement> = (row * n..((row + 1) * n).min(end))
+                .filter_map(|ix| {
+                    let hit = results.hits.get(ix)?;
+                    let entry = &hit.entry;
+                    let image = images.get(ix - start).cloned().flatten();
+                    let is_cursor = cursor == Some(ix);
+                    let rel = Arc::clone(&hit.rel);
+                    Some(
+                        Self::item_shell(ix, is_cursor, false, focused, None, cx)
+                            .a11y_item(ix, is_cursor, is_cursor, || rel.to_string())
+                            .tooltip(tooltip(rel.to_string()))
+                            .absolute()
+                            .left(cols.x(ix - row * n))
+                            .top_0()
+                            .w(tile.w)
+                            .h(height)
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .pt(grid::PAD_TOP)
+                            .px(grid::PAD_SIDE)
+                            .gap(grid::PAD_MID)
+                            .when(entry.is_hidden(), |d| d.text_color(theme::text_subtle()))
+                            .child(
+                                div()
+                                    .size(tile.image)
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(listed_visual(false, entry, image, tile.image, tile.icon)),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_center()
+                                    .line_clamp(2)
+                                    .text_ellipsis()
+                                    .text_size(grid::LABEL_SIZE)
+                                    .line_height(grid::LABEL_LINE)
+                                    .child(shown_name(entry, self.show_extensions)),
+                            )
+                            .into_any_element(),
+                    )
+                })
+                .collect();
+            div()
+                .relative()
+                .w_full()
+                .h(height)
+                .children(tiles)
+                .into_any_element()
+        })
+        .collect()
+    }
+
     /// List content: rows, tiles, search results, or the empty/loading state.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match over every list state; search tiles tipped it over"
+    )]
     fn list_body(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let message = |text: SharedString| {
             div()
@@ -1761,6 +1899,10 @@ impl Explorer {
                 _ if self.nothing_to_search() => message(self.search_prompt().into()),
                 Some(r) if r.hits.is_empty() && !r.searching => {
                     self.no_match_state(t!("list.no_match").into_owned(), None, cx)
+                }
+                Some(r) if self.search_view == ViewMode::Icons => {
+                    let len = r.hits.len();
+                    self.search_grid_list(len, focused, cx)
                 }
                 Some(r) => {
                     let list = uniform_list(
@@ -3242,8 +3384,11 @@ impl Render for Explorer {
                                     // PC" has no results (off, no text, still building).
                                     .when(
                                         self.failed.is_none()
-                                            && (self.search_mode
-                                                || self.view_mode == ViewMode::Details)
+                                            && (if self.search_mode {
+                                                !self.search_grid()
+                                            } else {
+                                                self.view_mode == ViewMode::Details
+                                            })
                                             && !(self.search_global
                                                 && self.search_results.is_none()),
                                         |d| d.child(self.render_header(cx)),

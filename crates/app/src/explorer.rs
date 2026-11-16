@@ -595,6 +595,9 @@ pub(crate) struct Explorer {
     /// The user picked "this folder" in the search panel: typing filters this folder instead of
     /// searching subfolders (the default).
     pub(crate) here_pinned: bool,
+    /// "Subfolders" picked in the panel before anything was typed: the next text searches them
+    /// (the folder's items stay shown until then).
+    pub(crate) subfolders_picked: bool,
     /// Wrapped line count of each name in the Icons view, for the layout.
     grid_lines: std::cell::RefCell<Option<(grid::LinesKey, Arc<[u8]>)>>,
     pub(crate) show_thumbnails: bool,
@@ -682,6 +685,11 @@ pub(crate) struct Explorer {
     /// chip reopens it.
     scope_strip_open: bool,
     search_scroll: UniformListScrollHandle,
+    /// How search results are shown: Icons (the default) or Details. Separate from the folder's
+    /// view so picking one while searching doesn't change the folder's remembered view.
+    pub(crate) search_view: ViewMode,
+    /// Tiles per row of the search results in Icons, from the last render.
+    pub(crate) search_cols: usize,
     typeahead: TypeAhead,
     pub(crate) view_mode: ViewMode,
     /// Icon size of the Icons view (`explorer_icons.rs`), remembered per folder with the view.
@@ -811,6 +819,9 @@ pub(crate) struct Explorer {
     pub(crate) preview_pick: Option<(PathBuf, Arc<str>)>,
     /// The picked item's picture once loaded (`None`: not a picture, or still loading).
     pub(crate) pick_image: Option<Arc<gpui::RenderImage>>,
+    /// An item from the folder preview's list shown in Quick Look instead of the cursor item
+    /// (a single click on a picture Arke decodes). Cleared once Quick Look is closed.
+    pub(crate) look_override: Option<(PathBuf, Entry)>,
     pub(crate) look_scroll: gpui::ScrollHandle,
     pub(crate) look_scrollbar: crate::scrollbar::ScrollbarDrag,
     /// Error banner button (server unreachable: retry; login needed: log in).
@@ -940,6 +951,7 @@ impl Explorer {
             grid_layout: std::cell::RefCell::default(),
             crumb_trail: None,
             here_pinned: false,
+            subfolders_picked: false,
             grid_lines: std::cell::RefCell::default(),
             show_thumbnails: settings.read(cx).settings.show_thumbnails,
             network_thumbnails: settings.read(cx).settings.network_thumbnails,
@@ -990,6 +1002,8 @@ impl Explorer {
             global_watch: None,
             scope_strip_open: false,
             search_scroll: UniformListScrollHandle::new(),
+            search_view: ViewMode::Icons,
+            search_cols: 1,
             typeahead: TypeAhead::default(),
             // The grid scroll benchmark starts in large icons.
             view_mode: if grid_bench {
@@ -1062,6 +1076,7 @@ impl Explorer {
             dir_ring_shown: false,
             preview_pick: None,
             pick_image: None,
+            look_override: None,
             look_scroll: gpui::ScrollHandle::new(),
             look_scrollbar: crate::scrollbar::ScrollbarDrag::default(),
             error_action: None,
@@ -2145,14 +2160,23 @@ impl Explorer {
     }
 
     fn on_query_changed(&mut self, cx: &mut Context<Self>) {
-        // Typing searches subfolders by default (Settings → Search); picking "this folder" in the
-        // panel keeps a live filter of the folder instead.
+        // Typing searches subfolders by default (Settings → Search) or when picked in the panel;
+        // picking "this folder" keeps a live filter of the folder instead.
         if !self.search_mode
-            && !self.here_pinned
-            && crate::prefs::search_subfolders()
-            && !self.query.is_empty()
+            && self.typing_scope() == scope::Scope::Subfolders
+            && !self.nothing_to_search()
         {
             self.set_scope(scope::Scope::Subfolders, cx);
+            return;
+        }
+        // Text cleared: the folder's own items come back until the next search (a search rooted
+        // at another folder keeps its prompt).
+        if self.search_mode
+            && !self.search_global
+            && self.search_in.is_none()
+            && self.nothing_to_search()
+        {
+            self.set_search_mode(false, cx);
             return;
         }
         if self.search_mode {
@@ -2173,6 +2197,7 @@ impl Explorer {
         }
         self.query.clear();
         self.here_pinned = false;
+        self.subfolders_picked = false;
         self.set_search_mode(false, cx);
         self.ensure_filtered(cx);
     }
@@ -2180,7 +2205,7 @@ impl Explorer {
     /// Input placeholders. They're set at creation, so reset them when the language or search mode
     /// changes.
     fn refresh_placeholders(&mut self, locale: &str, cx: &mut Context<Self>) {
-        let filter = match self.scope() {
+        let filter = match self.shown_scope() {
             scope::Scope::Here => t!("filter.placeholder", locale = locale),
             scope::Scope::Subfolders => self.search_in_name().map_or_else(
                 || t!("filter.search_placeholder", locale = locale),
@@ -2429,7 +2454,7 @@ impl Explorer {
         if self.search_mode {
             self.search_cursor = Some(ix);
             self.search_scroll
-                .scroll_to_item(ix, ScrollStrategy::Nearest);
+                .scroll_to_item(self.search_row(ix), ScrollStrategy::Nearest);
         } else if let Some(view) = self.view() {
             self.selection.select_only(&view, ix);
             self.cursor = Some(ix);
@@ -2463,6 +2488,47 @@ impl Explorer {
         self.view_mode == ViewMode::Icons && !self.search_mode
     }
 
+    /// Search results drawn as tiles.
+    pub(crate) fn search_grid(&self) -> bool {
+        self.search_mode && self.search_view == ViewMode::Icons
+    }
+
+    /// The view the toolbar shows as picked: the search's while searching.
+    pub(crate) const fn shown_view(&self) -> ViewMode {
+        if self.search_mode {
+            self.search_view
+        } else {
+            self.view_mode
+        }
+    }
+
+    /// Picks how search results are shown (Columns has no meaning there, so it shows Details).
+    pub(crate) fn pick_search_view(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        let mode = if mode == ViewMode::Icons {
+            ViewMode::Icons
+        } else {
+            ViewMode::Details
+        };
+        if self.search_view == mode {
+            return;
+        }
+        self.view_cue.fire();
+        self.search_view = mode;
+        let ix = self.search_cursor.unwrap_or(0);
+        self.search_scroll
+            .scroll_to_item(self.search_row(ix), ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    /// The search results list row that holds hit `ix`.
+    pub(crate) fn search_row(&self, ix: usize) -> usize {
+        if self.search_grid() {
+            ix / self.search_cols.max(1)
+        } else {
+            ix
+        }
+    }
+
     /// Scrolls to item `ix` (converted to a row in grid view).
     pub(super) fn scroll_to_index(&self, ix: usize, strategy: ScrollStrategy) {
         let row = if self.grid_active() {
@@ -2478,6 +2544,10 @@ impl Explorer {
 
     /// The user picked a view mode: show it and remember it for this folder.
     fn pick_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        if self.search_mode {
+            self.pick_search_view(mode, cx);
+            return;
+        }
         if self.view_mode == mode {
             return;
         }
@@ -2513,7 +2583,7 @@ impl Explorer {
         if self.turn_pdf_page(preview::PageTurn::Prev, cx) || self.tree_left(cx) {
             return;
         }
-        if self.grid_active() {
+        if self.grid_active() || self.search_grid() {
             self.select_index(self.target(Step::Left, w), cx);
         } else if self.columns_active() {
             // Column view: Left goes up.
@@ -2525,7 +2595,7 @@ impl Explorer {
         if self.turn_pdf_page(preview::PageTurn::Next, cx) || self.tree_right(cx) {
             return;
         }
-        if self.grid_active() {
+        if self.grid_active() || self.search_grid() {
             self.select_index(self.target(Step::Right, w), cx);
         } else if self.columns_active()
             && let Some(ix) = self.current_cursor()
@@ -2657,7 +2727,13 @@ impl Explorer {
     fn target(&self, step: Step, window: &Window) -> usize {
         let cur = self.current_cursor();
         // Grid view: up/down moves a whole row; page moves a screen of rows.
-        let (stride, page) = if self.grid_active() {
+        let (stride, page) = if self.search_grid() {
+            let cols = self.search_cols.max(1);
+            let rows = ((window.viewport_size().height - Self::list_chrome())
+                / grid::tile_height(self.tile(), 2))
+            .floor();
+            (cols, (rows as usize).max(1) * cols)
+        } else if self.grid_active() {
             let cols = self.grid_cols.max(1);
             let rows =
                 ((window.viewport_size().height - Self::list_chrome()) / self.tile().h).floor();

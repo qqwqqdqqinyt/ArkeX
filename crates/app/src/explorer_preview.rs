@@ -398,7 +398,7 @@ fn archive_preview(
     }
 }
 
-/// The Windows Shell's thumbnail as the preview image, for formats Rust can't decode (see
+/// The Windows Shell's thumbnail as the preview image, for files Rust can't decode (see
 /// `arke_core::filetype::can_shell_thumbnail`). Local fixed disks only. Background thread.
 fn shell_image_preview(shell: &dyn Shell, path: &Path, entry: &Entry) -> PreviewData {
     if !crate::media::wants_shell_thumbnail(entry) || !shell.is_local_disk(path) {
@@ -465,7 +465,7 @@ fn load(
             // Decoded in Rust when the format allows and the file is under the cap. Formats Rust
             // can't decode (PSD and the like) skip the read and get the Windows Shell's thumbnail,
             // which reads nothing here and so has no size cap.
-            let rust_format = !arke_core::filetype::shell_thumbnail_ext(entry.extension());
+            let rust_format = arke_core::filetype::decodes_in_rust(entry.extension());
             let photo = (rust_format && size <= arke_core::filetype::MAX_THUMBNAIL_SOURCE)
                 .then(|| {
                     fs.read(path, arke_core::filetype::MAX_THUMBNAIL_SOURCE)
@@ -510,7 +510,9 @@ fn load(
                 encoding,
             }
         }
-        _ => PreviewData::Nothing,
+        // Anything else (videos, Photoshop files, ...) gets the Windows Shell's thumbnail when a
+        // provider has one, as Explorer's preview does.
+        _ => shell_image_preview(shell, path, entry),
     }
 }
 
@@ -521,6 +523,12 @@ impl Explorer {
     /// would contradict the status line. Quick Look follows the cursor regardless, since Space on
     /// the cursor item asks for it explicitly.
     fn preview_target(&self) -> Option<(PathBuf, Entry)> {
+        // A picture opened from the folder preview's list, until Quick Look is gone.
+        if (self.quick_look || self.closing_quick_look.is_some())
+            && let Some(target) = &self.look_override
+        {
+            return Some(target.clone());
+        }
         if self.search_mode {
             // Search results are single-select: the cursor is the selection.
             let hit = self.search_hit(Some(self.current_cursor()?))?;
@@ -794,6 +802,7 @@ impl Explorer {
     /// preview pane shows it.
     fn after_quick_look(&mut self, cx: &mut Context<Self>) {
         self.reset_zoom(cx);
+        self.look_override = None;
         if !self.preview_pane {
             self.set_preview(None, cx);
         }
@@ -1395,8 +1404,15 @@ impl Explorer {
                         let dir = dir.to_path_buf();
                         let name = Arc::clone(&entry.name);
                         let (item, is_dir) = (dir.join(&*name), entry.is_dir_like());
-                        // Click: show it large above the list (again: back to the ring). Double
-                        // click: enter the folder with it selected. Right click: its menu.
+                        // Pictures Arke decodes itself open in Quick Look (as Space does).
+                        let look = (entry.kind == arke_core::EntryKind::File
+                            && !entry.is_cloud_placeholder()
+                            && arke_core::filetype::decodes_in_rust(entry.extension()))
+                        .then(|| (item.clone(), entry.clone()));
+                        // Click: a picture Arke decodes opens in Quick Look; anything else is
+                        // picked and, once it has a picture, shown large above the list (again:
+                        // back to the ring). Double click: enter the folder with it selected.
+                        // Right click: its menu.
                         row.cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Right,
@@ -1421,6 +1437,10 @@ impl Explorer {
                                         Some(Arc::clone(&name)),
                                         cx,
                                     );
+                                    return;
+                                }
+                                if let Some(target) = look.clone() {
+                                    this.look_at(target, cx);
                                     return;
                                 }
                                 let pick = (dir.clone(), Arc::clone(&name));
@@ -1681,10 +1701,44 @@ impl Explorer {
         cx.notify();
     }
 
-    /// The folder preview's picked item, filling the pane's width where the ring turns: its
-    /// picture once decoded, otherwise its type icon and name. Clicking it goes back to the ring.
+    /// A click on one of the ring's pictures: Quick Look for a picture Arke decodes, otherwise
+    /// open it.
+    pub(crate) fn ring_click(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let entry = match self.preview.as_ref().map(|p| &p.body) {
+            Some(PreviewBody::Folder { entries, .. }) => path
+                .file_name()
+                .and_then(|n| entries.iter().find(|e| *e.name == *n.to_string_lossy()))
+                .cloned(),
+            _ => None,
+        };
+        match entry {
+            Some(entry)
+                if entry.kind == arke_core::EntryKind::File
+                    && arke_core::filetype::decodes_in_rust(entry.extension()) =>
+            {
+                self.look_at((path, entry), cx);
+            }
+            _ => self.open_preview_item(path, cx),
+        }
+    }
+
+    /// Quick Look on `target`, an item of the folder preview's list (not the list's cursor).
+    fn look_at(&mut self, target: (PathBuf, Entry), cx: &mut Context<Self>) {
+        self.preview_pick = None;
+        self.pick_image = None;
+        self.look_override = Some(target);
+        if !self.quick_look {
+            self.toggle_quick_look(cx);
+        }
+        cx.notify();
+    }
+
+    /// The folder preview's picked item, filling the pane's width where the ring turns, once it
+    /// has a picture (items with none, or still loading, keep the ring: only what can be previewed
+    /// is shown large). Clicking it goes back to the ring.
     fn picked_view(&self, entries: &[Entry], cx: &mut Context<Self>) -> Option<AnyElement> {
         let (dir, name) = self.preview_pick.as_ref()?;
+        let image = self.pick_image.as_ref()?;
         let entry = entries.iter().find(|e| e.name == *name)?;
         let (path, is_dir) = (dir.join(&*entry.name), entry.is_dir_like());
         let width = self.pane_frame_w();
@@ -1693,29 +1747,10 @@ impl Explorer {
             .as_ref()
             .map_or(width, |ring| px(ring.read(cx).height()))
             .max(width * 0.75);
-        let body = match &self.pick_image {
-            Some(image) => gpui::img(Arc::clone(image))
-                .size_full()
-                .object_fit(gpui::ObjectFit::Contain)
-                .into_any_element(),
-            None => div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(theme::S_8)
-                .child(kind_icon(file_kind(entry), px(96.)))
-                .child(
-                    div()
-                        .max_w_full()
-                        .truncate()
-                        .text_size(theme::FS_12)
-                        .text_color(theme::text_subtle())
-                        .child(SharedString::from(Arc::clone(&entry.name))),
-                )
-                .into_any_element(),
-        };
+        let body = gpui::img(Arc::clone(image))
+            .size_full()
+            .object_fit(gpui::ObjectFit::Contain)
+            .into_any_element();
         Some(
             div()
                 .id("preview-pick")
@@ -2468,6 +2503,10 @@ impl Explorer {
     /// Quick Look's previous / next buttons: the item before or after the cursor, as ↑ and ↓ do
     /// in a list.
     fn look_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.look_override.is_some() {
+            // A picture from the folder preview isn't in the list; there's no neighbour to show.
+            return;
+        }
         let Some(cursor) = self.current_cursor() else {
             return;
         };

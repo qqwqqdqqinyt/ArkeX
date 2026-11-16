@@ -270,10 +270,20 @@ pub(crate) fn download(
     let dir = updates_dir().ok_or(UpdateError::NoUpdatesDir)?;
     std::fs::create_dir_all(&dir)?;
     let target = dir.join(&release.exe_name);
-    let part = target.with_extension("part");
+    // `arkex-1.2.3-setup.exe.part`: keeps the real name visible while it downloads.
+    let part = part_path(&target);
+    // Hashed while it downloads, so the file isn't opened again (a virus scanner often holds a
+    // fresh download for a moment).
+    let mut hasher = Sha256::new();
     {
-        let mut file = std::fs::File::create(&part)?;
-        crate::win_http::get(&release.exe_url, &[], &mut file, progress)?;
+        let file = std::fs::File::create(&part)?;
+        let mut out = HashingWriter {
+            inner: std::io::BufWriter::new(file),
+            hasher: &mut hasher,
+        };
+        crate::win_http::get(&release.exe_url, &[], &mut out, progress)?;
+        std::io::Write::flush(&mut out.inner)?;
+        out.inner.get_ref().sync_all()?;
     }
     if let Some(sha_url) = &release.sha_url {
         let expected = crate::win_http::get_text(sha_url, &[])?;
@@ -282,22 +292,67 @@ pub(crate) fn download(
             .next()
             .unwrap_or_default()
             .to_lowercase();
-        let bytes = std::fs::read(&part)?;
-        let actual = Sha256::digest(&bytes)
-            .iter()
-            .fold(String::new(), |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            });
+        let actual = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         if actual != expected {
             let _ = std::fs::remove_file(&part);
             return Err(UpdateError::BadHash);
         }
     }
-    let _ = std::fs::remove_file(&target);
-    std::fs::rename(&part, &target)?;
+    move_into_place(&part, &target)?;
     Ok(target)
+}
+
+/// `name.exe` -> `name.exe.part`.
+fn part_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// Renames the finished download to its real name. Windows Defender (or another scanner) briefly
+/// locks a file that was just written, so a failed rename is retried for a few seconds, then the
+/// file is copied instead.
+fn move_into_place(part: &Path, target: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..20u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let _ = std::fs::remove_file(target);
+        match std::fs::rename(part, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    match std::fs::copy(part, target) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) => Err(last.unwrap_or(e)),
+    }
+}
+
+/// Writes through to `inner` and feeds every byte to `hasher`.
+struct HashingWriter<'a, W: std::io::Write> {
+    inner: W,
+    hasher: &'a mut Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Replace the running exe (background thread): `arke.exe` -> `arke.exe.old`, the new one becomes
@@ -333,8 +388,14 @@ pub(crate) fn clean_up_old() {
     }
     if let Some(Ok(entries)) = updates_dir().map(std::fs::read_dir) {
         for entry in entries.flatten() {
-            if is_setup(&entry.path()) {
-                let _ = std::fs::remove_file(entry.path());
+            let path = entry.path();
+            // Installers from the last update, and downloads that never finished.
+            if is_setup(&path)
+                || path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("part"))
+            {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }

@@ -230,7 +230,7 @@ impl Render for DirRing {
                         let (path, owner) = (path.clone(), owner.clone());
                         move |_, _, cx| {
                             if let Some(owner) = owner.as_ref().and_then(WeakEntity::upgrade) {
-                                owner.update(cx, |e, cx| e.open_preview_item(path.clone(), cx));
+                                owner.update(cx, |e, cx| e.ring_click(path.clone(), cx));
                             }
                         }
                     })

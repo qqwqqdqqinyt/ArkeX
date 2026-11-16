@@ -212,6 +212,13 @@ impl Explorer {
 
     /// The user picked an icon size: show Icons at that size and remember it for this folder.
     pub(crate) fn pick_icon_size(&mut self, size: IconSize, cx: &mut Context<Self>) {
+        if self.search_mode {
+            // Search results: tiles at this size; the folder's own view stays as it was.
+            self.set_icon_size(size);
+            self.pick_search_view(ViewMode::Icons, cx);
+            cx.notify();
+            return;
+        }
         if self.view_mode == ViewMode::Icons && self.icon_size == size {
             return;
         }
@@ -273,7 +280,9 @@ impl Explorer {
 
     /// Ctrl+wheel over the list. Returns whether the event was used (so the list doesn't scroll).
     fn on_zoom_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) -> bool {
-        if self.search_mode || self.view_mode == ViewMode::Columns {
+        if (self.search_mode && !self.search_grid())
+            || (!self.search_mode && self.view_mode == ViewMode::Columns)
+        {
             return false;
         }
         let notches = match event.delta {
@@ -288,8 +297,11 @@ impl Explorer {
         self.zoom_accum -= whole;
         // Clamped by `zoom` anyway; a wheel never sends anywhere near i32's range.
         let steps = whole.clamp(-16., 16.) as i32;
-        match zoom(self.view_mode, self.icon_size, steps) {
+        match zoom(self.shown_view(), self.icon_size, steps) {
             Some(ZoomTarget::Icons(size)) => self.pick_icon_size(size, cx),
+            Some(ZoomTarget::Details) if self.search_mode => {
+                self.pick_search_view(ViewMode::Details, cx);
+            }
             Some(ZoomTarget::Details) => {
                 self.set_view_mode(ViewMode::Details, cx);
                 self.remember_folder_view(cx);

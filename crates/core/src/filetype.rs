@@ -97,6 +97,14 @@ pub fn wants_system_icon(entry: &Entry) -> bool {
 /// decode, so they get the type icon.
 pub const MAX_THUMBNAIL_SOURCE: u64 = 64 * 1024 * 1024;
 
+/// Image formats Arke decodes itself (thumbnails, the preview pane and Quick Look).
+pub fn decodes_in_rust(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "jfif" | "gif" | "bmp" | "webp" | "tif" | "tiff"
+    )
+}
+
 /// Formats we can decode in Rust for thumbnails (`.ico` uses the system icon).
 pub fn can_thumbnail(entry: &Entry) -> bool {
     entry.kind == EntryKind::File
@@ -104,15 +112,12 @@ pub fn can_thumbnail(entry: &Entry) -> bool {
         && !entry.is_cloud_placeholder()
         && entry.size > 0
         && entry.size <= MAX_THUMBNAIL_SOURCE
-        && matches!(
-            entry.extension(),
-            "png" | "jpg" | "jpeg" | "jfif" | "gif" | "bmp" | "webp" | "tif" | "tiff"
-        )
+        && decodes_in_rust(entry.extension())
 }
 
-/// Formats Rust can't decode but Windows may have a thumbnail provider for (built in, or one a
-/// third-party package registered, such as a PSD thumbnailer). Their pictures come from the
-/// Windows Shell by path; Arke never reads their bytes or names a provider.
+/// Picture formats Rust can't decode but Windows usually has a thumbnail provider for (built in,
+/// or one a third-party package registered, such as a PSD thumbnailer). Folder peeks look for
+/// these; the preview pane asks the Shell for them instead of reading the bytes.
 pub fn shell_thumbnail_ext(ext: &str) -> bool {
     matches!(
         ext,
@@ -120,15 +125,19 @@ pub fn shell_thumbnail_ext(ext: &str) -> bool {
     )
 }
 
-/// Whether to ask the Windows Shell for a thumbnail (see [`shell_thumbnail_ext`]). The same rules
-/// as [`can_thumbnail`] except the size cap: nothing is read here, and big PSDs need it most.
-/// Callers still check that the file is on a local fixed disk.
+/// Whether to ask the Windows Shell for a thumbnail: any file Arke can't decode itself (videos,
+/// PDFs, PSDs, Office files and whatever else has a provider), as Explorer does. Not for cloud
+/// placeholders (the provider would download them), empty files, or the `.exe`/`.lnk`/`.ico`
+/// files that get their system icon. Nothing is read here, so there is no size cap. Callers
+/// still check that the file is on a local fixed disk; a file with no provider fails once and
+/// that failure is cached.
 pub fn can_shell_thumbnail(entry: &Entry) -> bool {
     entry.kind == EntryKind::File
         // Asking for the thumbnail reads the file, which would download a cloud placeholder.
         && !entry.is_cloud_placeholder()
         && entry.size > 0
-        && shell_thumbnail_ext(entry.extension())
+        && !decodes_in_rust(entry.extension())
+        && !wants_system_icon(entry)
 }
 
 #[cfg(test)]
@@ -185,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_thumbnails_skip_the_size_cap_but_not_the_other_rules() {
+    fn shell_thumbnails_cover_what_rust_cannot_decode() {
         assert!(can_shell_thumbnail(&file("Poster.PSD", 10)));
         assert!(can_shell_thumbnail(&file(
             "big.psd",
@@ -196,7 +205,8 @@ mod tests {
             !can_shell_thumbnail(&file("a.png", 10)),
             "decoded in Rust instead"
         );
-        assert!(!can_shell_thumbnail(&file("notes.txt", 10)));
+        assert!(can_shell_thumbnail(&file("clip.mp4", 10)), "any format with a provider");
+        assert!(!can_shell_thumbnail(&file("app.exe", 10)), "system icon instead");
         let online_only = Entry::new("a.psd", EntryKind::File, 1000, None, 0x40_0000);
         assert!(!can_shell_thumbnail(&online_only));
         let dir = Entry::new("x.psd", EntryKind::Dir, 0, None, 0);

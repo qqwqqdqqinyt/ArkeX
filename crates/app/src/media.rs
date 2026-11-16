@@ -1,10 +1,15 @@
 //! Thumbnail and system icon cache, one per app, shared by all tabs and windows.
 //!
 //! - Thumbnails: 3 background threads read via `Fs::read` and decode with `arke_core::thumbs`.
-//! - System icons: 1 background thread (COM STA), only for `.exe`, `.lnk`, `.ico`.
-//! - Shell thumbnails: 2 background threads (COM STA) ask Windows for the thumbnail of formats
-//!   Rust can't decode (PSD and the like, `can_shell_thumbnail`). No bytes are read here, so the
-//!   64 MB source cap doesn't apply. The Shell thumbnails setting (or `ARKE_NO_SHELL_THUMBNAILS`) turns this off.
+//! - System icons: 1 background thread (COM STA), only for `.exe`, `.lnk`, `.ico`, asked for at
+//!   the size they are drawn at (one of [`SOURCE_SIZES`] in the grid, [`LIST_ICON_PX`] in lists),
+//!   so big tiles don't stretch a small icon.
+//! - Shell thumbnails: 2 background threads (COM STA) ask Windows for the thumbnail of any file
+//!   Rust can't decode (videos, PDFs, PSDs, ... `can_shell_thumbnail`). No bytes are read here, so
+//!   the 64 MB source cap doesn't apply. Files with no provider fail once; the failure is cached
+//!   like any other. The Shell thumbnails setting (or `ARKE_NO_SHELL_THUMBNAILS`) turns this off.
+//! - Order for a file: Arke's own thumbnail, else the Shell's, else the system or type icon, else
+//!   the drawn kind icon.
 //! - Folder peeks: 1 background thread finds the first picture in a folder, which the Icons view
 //!   shows between the folder's back and front panels.
 //! - Type icons: 1 background thread (COM STA) asks the Shell for the icon of each file type
@@ -23,7 +28,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use arke_core::filetype::{
-    MAX_THUMBNAIL_SOURCE, can_shell_thumbnail, can_thumbnail, wants_system_icon,
+    MAX_THUMBNAIL_SOURCE, can_shell_thumbnail, can_thumbnail, shell_thumbnail_ext,
+    wants_system_icon,
 };
 use arke_core::loader::Loader;
 use arke_core::thumbs::{SOURCE_SIZES, THUMBNAIL_SIZE, Thumbnail, decode_thumbnail};
@@ -32,8 +38,9 @@ use gpui::{App, AppContext, Context, Entity, Global, RenderImage, Task};
 
 use crate::explorer::Services;
 
-/// System icon pixel size (the grid shows them at 64 px, the list at 16).
-pub(crate) const SYSTEM_ICON_SIZE: u32 = 64;
+/// System icon size for lists and anywhere no thumbnail size is given (16 px rows, sharp up to
+/// 300% display scale).
+pub(crate) const LIST_ICON_PX: u32 = 48;
 /// Cache budget (decoded pixel bytes). A 192px thumbnail is about 150 KB, so roughly 800 fit.
 const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 
@@ -71,7 +78,7 @@ pub(crate) struct MediaKey {
     modified: Option<SystemTime>,
     size: u64,
     pub(crate) kind: MediaKind,
-    /// Longest side to decode a thumbnail at; 0 for system icons.
+    /// Longest side to decode a thumbnail at, or the system icon's size.
     px: u32,
 }
 
@@ -88,10 +95,32 @@ impl MediaKey {
         Self::at(dir.join(&*entry.name), entry, thumbnail_px)
     }
 
-    /// Key for the file at `path` (whose listing entry is `entry`).
+    /// Like [`Self::sized`], with system icons asked for at `icon_px` (the grid's drawn size even
+    /// when thumbnails are off).
+    pub(crate) fn sized_icons(
+        dir: &Path,
+        entry: &Entry,
+        thumbnail_px: Option<u32>,
+        icon_px: u32,
+    ) -> Option<Self> {
+        Self::with_icon(dir.join(&*entry.name), entry, thumbnail_px, icon_px)
+    }
+
+    /// Key for the file at `path` (whose listing entry is `entry`). System icons come at the
+    /// thumbnail size, or [`LIST_ICON_PX`] without one.
     pub(crate) fn at(path: PathBuf, entry: &Entry, thumbnail_px: Option<u32>) -> Option<Self> {
+        let icon_px = thumbnail_px.unwrap_or(LIST_ICON_PX);
+        Self::with_icon(path, entry, thumbnail_px, icon_px)
+    }
+
+    fn with_icon(
+        path: PathBuf,
+        entry: &Entry,
+        thumbnail_px: Option<u32>,
+        icon_px: u32,
+    ) -> Option<Self> {
         let (kind, px) = if wants_system_icon(entry) {
-            (MediaKind::SystemIcon, 0)
+            (MediaKind::SystemIcon, icon_px.max(16))
         } else if can_thumbnail(entry) {
             (MediaKind::Thumbnail, thumbnail_px?)
         } else if wants_shell_thumbnail(entry) {
@@ -135,7 +164,11 @@ fn first_picture(fs: &dyn Fs, dir: &Path) -> Option<Entry> {
         .read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
-        .filter(|e| !e.is_hidden() && (can_thumbnail(e) || (shell && can_shell_thumbnail(e))))
+        .filter(|e| {
+            !e.is_hidden()
+                && (can_thumbnail(e)
+                    || (shell && can_shell_thumbnail(e) && shell_thumbnail_ext(e.extension())))
+        })
         .collect();
     SortSpec::default().sort(&mut files);
     files.into_iter().next()
@@ -282,7 +315,7 @@ impl MediaStore {
             let shell = Arc::clone(&services.shell);
             let tx = tx.clone();
             Loader::new("system-icon", 1, move |key: &MediaKey| {
-                let icon = shell.file_icon(&key.path, SYSTEM_ICON_SIZE);
+                let icon = shell.file_icon(&key.path, key.px.max(16));
                 let _ = tx.send(MediaEvent::Loaded(key.clone(), icon));
             })
         };
@@ -360,6 +393,12 @@ impl MediaStore {
                 self.loader(key.kind).acknowledge(&key);
                 let size = thumb.as_ref().map_or(0, |t| t.rgba.len());
                 let image = thumb.and_then(to_render_image);
+                if key.kind == MediaKind::SystemIcon
+                    && let Some(image) = &image
+                {
+                    // Drawn at icon size like type icons, whatever its pixel size.
+                    TYPE_ICON_IDS.with(|ids| ids.borrow_mut().insert(image.id));
+                }
                 if self.cache.insert(key.clone(), image).is_none() {
                     self.order.push_back(key);
                     self.bytes += size;
@@ -396,6 +435,7 @@ impl MediaStore {
             };
             if let Some(Some(image)) = self.cache.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(image_bytes(&image));
+                TYPE_ICON_IDS.with(|ids| ids.borrow_mut().remove(&image.id));
                 // Remove from every window's GPU atlas; dropping the reference alone leaves the
                 // texture in video memory.
                 cx.drop_image(image, None);
@@ -433,10 +473,11 @@ impl MediaStore {
         if let Some(found) = self.cache.get(key) {
             return found.clone();
         }
-        if key.kind == MediaKind::SystemIcon {
-            return None;
-        }
-        let mut others: Vec<u32> = SOURCE_SIZES.into_iter().filter(|&s| s != key.px).collect();
+        let mut others: Vec<u32> = SOURCE_SIZES
+            .into_iter()
+            .chain([LIST_ICON_PX])
+            .filter(|&s| s != key.px)
+            .collect();
         others.sort_by_key(|&s| s.abs_diff(key.px));
         let mut probe = key.clone();
         others.into_iter().find_map(|px| {
