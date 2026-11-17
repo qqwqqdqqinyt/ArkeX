@@ -7,6 +7,7 @@
 //! on background threads. Results come back over flume channels and are handled in `handle_event`.
 
 use rust_i18n::t;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,7 +105,7 @@ pub(crate) use view::{caption_buttons, ghost_button, kind_icon, tooltip};
 
 use crate::bench::{Bench, BenchStep};
 use crate::media::MediaStore;
-use crate::settings::{Density, SettingsStore};
+use crate::settings::{Density, DetailsSize, SettingsStore};
 use crate::shell::{Place, Shell};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme;
@@ -429,6 +430,9 @@ pub(crate) enum ExplorerEvent {
 }
 
 /// Where this `Explorer` sits in its tab. Set by `Workspace` before every render.
+/// A folder expanded in the preview list: its entries (once listed) and its total count.
+pub(crate) type OpenListing = (Arc<Vec<Entry>>, usize);
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent facts about where the pane sits in its tab"
@@ -750,8 +754,12 @@ pub(crate) struct Explorer {
     /// Press inside a multi-selection: keep the selection (it may be dragged) and narrow to this
     /// item on release if no drag happened.
     click_select: Option<usize>,
+    /// Slow click to rename (click the only selected item, then wait; see `arke_core::slow_click`).
+    slow_click: arke_core::slow_click::SlowClick<Arc<str>>,
     /// List density (settings, shared by all tabs).
     pub(crate) density: Density,
+    /// Item size in the Details view (settings, shared by all tabs).
+    pub(crate) details_size: DetailsSize,
     /// Preview pane on the right is open (settings).
     pub(crate) preview_pane: bool,
     /// The preview pane was just turned on: it slides in (only then, not on every redraw).
@@ -811,17 +819,19 @@ pub(crate) struct Explorer {
     /// Where the progress ring is drawn now; eases toward the real progress.
     pub(crate) ring_shown: std::rc::Rc<std::cell::Cell<f32>>,
     pub(crate) preview_scrollbar: crate::scrollbar::ScrollbarDrag,
-    /// The previewed folder's first pictures on a ring (Atlas), and whether it has any to show.
-    pub(crate) dir_ring: Option<Entity<crate::dir_ring::DirRing>>,
-    pub(crate) dir_ring_shown: bool,
-    /// Folder preview: the item single-clicked in its listing (folder, name), shown large where
-    /// the ring is; a double click opens it instead.
+    /// Folder preview: subfolders expanded in place in its list (`None`: still loading), for the
+    /// folder in `preview_open_root`.
+    pub(crate) preview_open: HashMap<PathBuf, Option<OpenListing>>,
+    pub(crate) preview_open_root: Option<PathBuf>,
+    /// Folder preview: the file single-clicked in its list (folder, name), previewed large above
+    /// the list; a double click opens it instead.
     pub(crate) preview_pick: Option<(PathBuf, Arc<str>)>,
-    /// The picked item's picture once loaded (`None`: not a picture, or still loading).
+    /// The picked item's picture once loaded (`None`: no picture, or still loading).
     pub(crate) pick_image: Option<Arc<gpui::RenderImage>>,
-    /// An item from the folder preview's list shown in Quick Look instead of the cursor item
-    /// (a single click on a picture Arke decodes). Cleared once Quick Look is closed.
-    pub(crate) look_override: Option<(PathBuf, Entry)>,
+    /// The previewed folder's first picture, shown above its list until a file is picked.
+    pub(crate) preview_cover: Option<(PathBuf, Arc<gpui::RenderImage>)>,
+    /// Thumbnails (or type icons) of the folder preview's rows, by path.
+    pub(crate) preview_thumbs: HashMap<PathBuf, Arc<gpui::RenderImage>>,
     pub(crate) look_scroll: gpui::ScrollHandle,
     pub(crate) look_scrollbar: crate::scrollbar::ScrollbarDrag,
     /// Error banner button (server unreachable: retry; login needed: log in).
@@ -1041,7 +1051,9 @@ impl Explorer {
             pane: PaneInfo::default(),
             compare: None,
             click_select: None,
+            slow_click: arke_core::slow_click::SlowClick::default(),
             density: settings.read(cx).settings.density,
+            details_size: settings.read(cx).settings.details_size,
             preview_pane: settings.read(cx).settings.preview_pane,
             preview_cue: crate::motion::Cue::default(),
             view_cue: crate::motion::Cue::default(),
@@ -1072,11 +1084,12 @@ impl Explorer {
             preview_scroll: gpui::ScrollHandle::new(),
             ring_shown: std::rc::Rc::default(),
             preview_scrollbar: crate::scrollbar::ScrollbarDrag::default(),
-            dir_ring: None,
-            dir_ring_shown: false,
+            preview_open: HashMap::new(),
+            preview_open_root: None,
             preview_pick: None,
             pick_image: None,
-            look_override: None,
+            preview_cover: None,
+            preview_thumbs: HashMap::new(),
             look_scroll: gpui::ScrollHandle::new(),
             look_scrollbar: crate::scrollbar::ScrollbarDrag::default(),
             error_action: None,
@@ -2641,6 +2654,7 @@ impl Explorer {
             }
         }
         self.density = settings.density;
+        self.details_size = settings.details_size;
         if settings.preview_pane && !self.preview_pane {
             self.preview_cue.fire();
         }
@@ -2702,16 +2716,29 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Split panes are half width, so they use compact density.
-    pub(crate) const fn row_height(&self) -> Pixels {
-        if self.pane.split {
-            return theme::H_ROW_COMPACT;
-        }
-        match self.density {
-            Density::Compact => theme::H_ROW_COMPACT,
-            Density::Standard => theme::H_ROW,
-            Density::Comfortable => theme::H_ROW_COMFORTABLE,
-        }
+    /// Split panes are half width, so they use compact density. The Details view's medium and
+    /// large sizes add to the density's height.
+    pub(crate) fn row_height(&self) -> Pixels {
+        let base = if self.pane.split {
+            theme::H_ROW_COMPACT
+        } else {
+            match self.density {
+                Density::Compact => theme::H_ROW_COMPACT,
+                Density::Standard => theme::H_ROW,
+                Density::Comfortable => theme::H_ROW_COMFORTABLE,
+            }
+        };
+        base + self.details_metrics().extra_row
+    }
+
+    /// Icon sizes and extra row height of the Details view at its size (Small everywhere else).
+    pub(crate) fn details_metrics(&self) -> DetailsMetrics {
+        let size = if self.shown_view() == ViewMode::Details {
+            self.details_size
+        } else {
+            DetailsSize::Small
+        };
+        DetailsMetrics::of(size)
     }
 
     /// Too narrow for the Date modified column.
@@ -2948,9 +2975,11 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let had_focus = self.list_focus.is_focused(window);
         window.focus(&self.list_focus, cx);
         self.row_pressed = true;
         let m = event.modifiers;
+        self.slow_click_press(ix, event, had_focus);
         if self.search_mode {
             self.search_cursor = Some(ix);
         } else if let Some(view) = self.view() {
@@ -2978,6 +3007,86 @@ impl Explorer {
             self.open_index(ix, cx);
         }
         cx.notify();
+    }
+
+    /// Left press on a row: arm slow-click rename when this is a plain single click on what was
+    /// already the only selected item (before this press changes the selection).
+    fn slow_click_press(&mut self, ix: usize, event: &MouseDownEvent, had_focus: bool) {
+        let m = event.modifiers;
+        let name = if self.search_mode {
+            None
+        } else {
+            self.view()
+                .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
+        };
+        let Some(name) = name else {
+            self.slow_click.cancel();
+            return;
+        };
+        let press = arke_core::slow_click::Press {
+            click_count: event.click_count,
+            modifiers: m.control || m.shift || m.alt || m.platform,
+            was_sole_selection: self.selection.len() == 1 && self.selection.contains(&name),
+            had_focus,
+            blocked: crate::prefs::single_click() || self.renaming.is_some(),
+        };
+        self.slow_click.press(name, press);
+    }
+
+    /// Click (release without a drag) on a row: start the slow-click wait, the system
+    /// double-click time, and rename if nothing cancels it meanwhile.
+    pub(super) fn slow_click_release(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self
+            .view()
+            .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
+        else {
+            self.slow_click.cancel();
+            return;
+        };
+        let delay = crate::win::rename_click_delay();
+        let Some(ticket) = self.slow_click.release(&name, Instant::now(), delay) else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let focused = this.list_focus.is_focused(window);
+                let selection = &this.selection;
+                let renaming = this.renaming.is_some();
+                let fired = this.slow_click.fire(ticket, Instant::now(), |name| {
+                    focused && !renaming && selection.len() == 1 && selection.contains(name)
+                });
+                if let Some(name) = fired {
+                    this.start_rename(name, window, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The pointer left a row: a pending slow-click rename for it is off.
+    pub(super) fn slow_click_leave(&mut self, ix: usize) {
+        if !self.slow_click.is_armed() {
+            return;
+        }
+        match self
+            .view()
+            .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
+        {
+            Some(name) => self.slow_click.leave(&name),
+            None => self.slow_click.cancel(),
+        }
+    }
+
+    /// A key, a right click, a scroll or a drag: no slow-click rename.
+    pub(super) fn slow_click_cancel(&mut self) {
+        self.slow_click.cancel();
     }
 
     /// Single-click mode: opens on release if there was no drag and no Ctrl/Shift. Returns whether
@@ -3354,5 +3463,42 @@ mod tab_title_tests {
         );
         assert_eq!(tab_title_for(Path::new(r"\\nas\docs\")), "docs");
         assert_eq!(tab_title_for(Path::new(r"\\nas\docs\2026")), "2026");
+    }
+}
+
+/// What a Details size draws: file icon and folder icon edges (folders a little larger, as in
+/// Explorer), the thumbnail edge when the size shows thumbnails, and the height added to a row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DetailsMetrics {
+    pub(crate) icon: Pixels,
+    pub(crate) folder: Pixels,
+    pub(crate) thumbnail: Option<Pixels>,
+    pub(crate) extra_row: Pixels,
+}
+
+impl DetailsMetrics {
+    /// One edge per size for every row, like Finder's list view: files, folders and picture
+    /// thumbnails share the same square (16, 24, 32).
+    pub(crate) const fn of(size: DetailsSize) -> Self {
+        match size {
+            DetailsSize::Small => Self {
+                icon: theme::ICON,
+                folder: theme::ICON,
+                thumbnail: None,
+                extra_row: px(0.),
+            },
+            DetailsSize::Medium => Self {
+                icon: px(24.),
+                folder: px(24.),
+                thumbnail: None,
+                extra_row: px(4.),
+            },
+            DetailsSize::Large => Self {
+                icon: px(32.),
+                folder: px(32.),
+                thumbnail: Some(px(32.)),
+                extra_row: px(12.),
+            },
+        }
     }
 }

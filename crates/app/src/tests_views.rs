@@ -81,6 +81,26 @@ fn icon_sizes_by_keys_and_ctrl_wheel(cx: &mut TestAppContext) {
     assert_eq!(icons_of(&view, cx), (ViewMode::Icons, IconSize::SMALL));
     ctrl_wheel(cx, &view, -1.);
     assert_eq!(view.update(cx, |v, _| v.view_mode), ViewMode::Details);
+    // Details has three sizes of its own: it arrives at the small one, and wheel up walks
+    // through medium to large (thumbnails) before going back to small icons.
+    let details = |cx: &mut VisualTestContext| view.update(cx, |v, _| v.details_size);
+    assert_eq!(details(cx), crate::settings::DetailsSize::Small);
+    let small_row = view.update(cx, |v, _| v.row_height());
+    ctrl_wheel(cx, &view, -1.);
+    assert_eq!(
+        details(cx),
+        crate::settings::DetailsSize::Small,
+        "the smallest"
+    );
+    assert_eq!(view.update(cx, |v, _| v.view_mode), ViewMode::Details);
+    ctrl_wheel(cx, &view, 1.);
+    assert_eq!(details(cx), crate::settings::DetailsSize::Medium);
+    let medium_row = view.update(cx, |v, _| v.row_height());
+    assert!(medium_row > small_row);
+    ctrl_wheel(cx, &view, 1.);
+    assert_eq!(details(cx), crate::settings::DetailsSize::Large);
+    assert!(view.update(cx, |v, _| v.row_height()) > medium_row);
+    assert_eq!(view.update(cx, |v, _| v.view_mode), ViewMode::Details);
     ctrl_wheel(cx, &view, 1.);
     assert_eq!(icons_of(&view, cx), (ViewMode::Icons, IconSize::SMALL));
     // Touchpads send small precise amounts; they add up to a step.

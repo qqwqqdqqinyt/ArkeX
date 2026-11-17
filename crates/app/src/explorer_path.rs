@@ -603,12 +603,15 @@ impl Explorer {
             .a11y(gpui::Role::Toolbar, t!("a11y.address"))
             .relative()
             .min_w_0()
-            .h(theme::H_CTL)
+            .h(theme::H_TOP)
             .flex()
             .items_center()
             .ml(theme::S_4)
             .px(theme::S_4)
             .rounded(theme::R_8)
+            // Same box as the search box (1 px border inside the height), so both read as one
+            // height and typing a path doesn't shift the bar.
+            .border_1()
             .child(capture);
         if self.editing_path {
             return bar
@@ -640,9 +643,12 @@ impl Explorer {
         let min_w = theme::PATH_MIN_W
             .min(self.path_slot.get() - self.path_drag_min() - theme::S_4)
             .max(px(0.));
+        // The tone hovering used to give is now the bar's resting background; typing a path keeps
+        // its own look (paper with the focus line, above).
         bar.min_w(min_w)
             .cursor_text()
-            .hover(|s| s.bg(theme::wash()))
+            .bg(theme::wash())
+            .border_color(theme::clear())
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.start_edit_path(window, cx);
             }))

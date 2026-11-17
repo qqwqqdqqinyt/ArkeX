@@ -56,6 +56,7 @@ pub mod scrub;
 pub mod search;
 pub mod selection;
 pub mod service;
+pub mod slow_click;
 pub mod sort;
 pub mod takeover;
 pub mod text;

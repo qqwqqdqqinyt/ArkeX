@@ -183,6 +183,10 @@ pub(crate) const H_CTL_SM: Pixels = px(26.);
 pub(crate) const H_CTL_MD: Pixels = px(30.);
 /// Frame top bar.
 pub(crate) const H_BAR: Pixels = px(48.);
+/// Every control on the frame top bar and the sidebar's top rows: Home, back / forward / up /
+/// refresh, the path bar and the search box share this height and sit centered in [`H_BAR`]. The
+/// toolbar size setting scales only the context bar below, so these stay equal at any scale.
+pub(crate) const H_TOP: Pixels = H_CTL;
 /// Context bar at its original size; see [`h_ctx`] for the height as drawn.
 pub(crate) const H_CTX: Pixels = px(44.);
 
@@ -313,6 +317,13 @@ pub(crate) struct Palette {
     diff_unique: Rgba,
     /// Folder compare: an item both sides have in different versions (amber).
     diff_changed: Rgba,
+    /// Context menu icon tones: blue-gray main (ink mixed 22% toward `diff_unique`), steel accent
+    /// (`diff_unique` mixed 30% toward ink), amber for folders (folder amber 12% toward ink) and
+    /// its deeper shade for the folder's plus (32% toward ink).
+    tone_main: Rgba,
+    tone_steel: Rgba,
+    tone_amber: Rgba,
+    tone_amber_deep: Rgba,
     on_signal: Rgba,
     veil: Rgba,
     /// Fraction of the signal color mixed into the frame.
@@ -353,6 +364,10 @@ pub(crate) const LIGHT: Palette = Palette {
     synced: hex(0x107c10),
     diff_unique: hex(0x0a5aa4),
     diff_changed: hex(0x875000),
+    tone_main: hex(0x172939),
+    tone_steel: hex(0x0f477b),
+    tone_amber: hex(0xc3852a),
+    tone_amber_deep: hex(0x9d6d27),
     on_signal: hex(0xffffff),
     veil: hex(0x141414),
     frame_tint: 0.,
@@ -385,6 +400,10 @@ pub(crate) const DARK: Palette = Palette {
     synced: hex(0x6ccb5f),
     diff_unique: hex(0x60cdff),
     diff_changed: hex(0xf2c661),
+    tone_main: hex(0xb5cfde),
+    tone_steel: hex(0x81cef2),
+    tone_amber: hex(0xf0c864),
+    tone_amber_deep: hex(0xe8ca7e),
     on_signal: hex(0x1a0f0a),
     veil: hex(0x000000),
     frame_tint: 0.,
@@ -1066,6 +1085,26 @@ pub(crate) fn diff_unique() -> Rgba {
 /// Folder compare badge for an item that differs between the sides (newer, older, different).
 pub(crate) fn diff_changed() -> Rgba {
     p().diff_changed
+}
+/// Context menu icon tone: blue-gray, the base of every menu icon.
+pub(crate) fn tone_main() -> Rgba {
+    p().tone_main
+}
+/// Context menu icon tone: steel blue, a sparing accent (new text file, views, copy path).
+pub(crate) fn tone_steel() -> Rgba {
+    p().tone_steel
+}
+/// Context menu icon tone: amber, only for folder commands.
+pub(crate) fn tone_amber() -> Rgba {
+    p().tone_amber
+}
+/// Context menu icon tone: deeper amber for the plus on "New folder".
+pub(crate) fn tone_amber_deep() -> Rgba {
+    p().tone_amber_deep
+}
+/// `color` faded like disabled text.
+pub(crate) fn disabled_tone(color: Rgba) -> Rgba {
+    alpha(color, p().a_disabled)
 }
 /// Fill behind a folder compare badge, from its text color.
 pub(crate) const fn diff_wash(color: Rgba) -> Rgba {

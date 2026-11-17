@@ -195,7 +195,12 @@ impl TextInput {
     }
 
     /// Runs a right-click menu row.
-    pub(crate) fn run_menu_item(&mut self, item: MenuItem, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn run_menu_item(
+        &mut self,
+        item: MenuItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.menu = None;
         match item {
             MenuItem::Undo => self.undo(&Undo, window, cx),
@@ -274,7 +279,12 @@ impl TextInput {
         }
     }
 
-    fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_right_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Like Windows: a right click outside the selection moves the caret there first.
         let at = self.index_for_mouse_position(event.position);
         if self.selected_range.is_empty()
@@ -297,56 +307,59 @@ impl TextInput {
             .and_then(|item| item.text())
             .is_some_and(|text| !text.is_empty());
         let items = self.menu_items(clipboard);
-        let rows = items.into_iter().enumerate().flat_map(|(ix, (item, enabled))| {
-            let (label, keys) = match item {
-                MenuItem::Undo => (t!("input.undo"), "Ctrl+Z"),
-                MenuItem::Cut => (t!("input.cut"), "Ctrl+X"),
-                MenuItem::Copy => (t!("input.copy"), "Ctrl+C"),
-                MenuItem::Paste => (t!("input.paste"), "Ctrl+V"),
-                MenuItem::PasteAndGo => (t!("input.paste_go"), ""),
-                MenuItem::Delete => (t!("input.delete"), "Del"),
-                MenuItem::SelectAll => (t!("input.select_all"), "Ctrl+A"),
-            };
-            // Separators as in Windows: after Undo and before Select all.
-            let rule = matches!(item, MenuItem::Cut | MenuItem::SelectAll).then(|| {
-                div()
-                    .mx(theme::S_8)
-                    .my(theme::S_4)
-                    .h(px(1.))
-                    .bg(theme::line())
-                    .into_any_element()
-            });
-            let row = div()
-                .id(("input-menu", ix))
-                .role(gpui::Role::MenuItem)
-                .h(px(30.))
-                .mx(theme::S_4)
-                .px(theme::S_8)
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(theme::S_16)
-                .rounded(theme::R_4)
-                .when(enabled, |d| {
-                    d.cursor_pointer()
-                        .text_color(theme::text())
-                        .hover(|s| s.bg(theme::wash()))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
-                            this.run_menu_item(item, window, cx);
-                        }))
-                })
-                .when(!enabled, |d| d.text_color(theme::text_disabled()))
-                .child(label.into_owned())
-                .child(
+        let rows = items
+            .into_iter()
+            .enumerate()
+            .flat_map(|(ix, (item, enabled))| {
+                let (label, keys) = match item {
+                    MenuItem::Undo => (t!("input.undo"), "Ctrl+Z"),
+                    MenuItem::Cut => (t!("input.cut"), "Ctrl+X"),
+                    MenuItem::Copy => (t!("input.copy"), "Ctrl+C"),
+                    MenuItem::Paste => (t!("input.paste"), "Ctrl+V"),
+                    MenuItem::PasteAndGo => (t!("input.paste_go"), ""),
+                    MenuItem::Delete => (t!("input.delete"), "Del"),
+                    MenuItem::SelectAll => (t!("input.select_all"), "Ctrl+A"),
+                };
+                // Separators as in Windows: after Undo and before Select all.
+                let rule = matches!(item, MenuItem::Cut | MenuItem::SelectAll).then(|| {
                     div()
-                        .text_size(theme::FS_12)
-                        .text_color(theme::text_subtle())
-                        .child(keys),
-                )
-                .into_any_element();
-            rule.into_iter().chain(std::iter::once(row))
-        });
+                        .mx(theme::S_8)
+                        .my(theme::S_4)
+                        .h(px(1.))
+                        .bg(theme::line())
+                        .into_any_element()
+                });
+                let row = div()
+                    .id(("input-menu", ix))
+                    .role(gpui::Role::MenuItem)
+                    .h(px(30.))
+                    .mx(theme::S_4)
+                    .px(theme::S_8)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(theme::S_16)
+                    .rounded(theme::R_4)
+                    .when(enabled, |d| {
+                        d.cursor_pointer()
+                            .text_color(theme::text())
+                            .hover(|s| s.bg(theme::wash()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                                this.run_menu_item(item, window, cx);
+                            }))
+                    })
+                    .when(!enabled, |d| d.text_color(theme::text_disabled()))
+                    .child(label.into_owned())
+                    .child(
+                        div()
+                            .text_size(theme::FS_12)
+                            .text_color(theme::text_subtle())
+                            .child(keys),
+                    )
+                    .into_any_element();
+                rule.into_iter().chain(std::iter::once(row))
+            });
         gpui::deferred(
             gpui::anchored()
                 .position(at)

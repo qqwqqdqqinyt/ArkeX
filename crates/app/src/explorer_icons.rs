@@ -13,12 +13,12 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AnyElement, Context, DispatchPhase, ScrollDelta, ScrollEvent, Window, canvas,
-    prelude::*, px,
+    AnyElement, Context, DispatchPhase, ScrollDelta, ScrollEvent, Window, canvas, prelude::*, px,
 };
 use rust_i18n::t;
 
 use super::{Explorer, ViewIcons, ViewIconsExtraLarge, ViewIconsMedium, ViewIconsSmall, ViewMode};
+use crate::settings::DetailsSize;
 use crate::theme;
 
 /// Icon size of the Icons view: the edge of a tile's image area in logical pixels, a multiple of
@@ -33,7 +33,7 @@ const PIXELS_PER_STEP: f32 = 48.;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ZoomTarget {
     Icons(IconSize),
-    Details,
+    Details(DetailsSize),
 }
 
 impl Default for IconSize {
@@ -183,25 +183,38 @@ impl<'de> serde::Deserialize<'de> for IconSize {
     }
 }
 
-/// Where `steps` Ctrl+wheel notches (positive: larger) go from `view` at `size`. Columns view and
-/// moves that end where they started stay put (`None`).
-pub(crate) fn zoom(view: ViewMode, size: IconSize, steps: i32) -> Option<ZoomTarget> {
-    // Details sits one notch below small icons (`None` here).
+/// Where `steps` Ctrl+wheel notches (positive: larger) go from `view` at `size` (Icons) or
+/// `details` (Details). The Details sizes sit below small icons: small, medium, then large rows
+/// with thumbnails, then small icons. Columns view and moves that end where they started stay put
+/// (`None`).
+pub(crate) fn zoom(
+    view: ViewMode,
+    size: IconSize,
+    details: DetailsSize,
+    steps: i32,
+) -> Option<ZoomTarget> {
     let start = match view {
-        ViewMode::Details => None,
-        ViewMode::Icons => Some(size),
+        ViewMode::Details => ZoomTarget::Details(details),
+        ViewMode::Icons => ZoomTarget::Icons(size),
         ViewMode::Columns => return None,
     };
     let mut at = start;
     // More notches than stops can't go further than the ends.
     for _ in 0..steps.unsigned_abs().min(16) {
-        at = if steps > 0 {
-            Some(at.map_or(IconSize::SMALL, |s| s.larger().unwrap_or(s)))
-        } else {
-            at.and_then(IconSize::smaller)
+        at = match (at, steps > 0) {
+            (ZoomTarget::Details(d), true) => d
+                .larger()
+                .map_or(ZoomTarget::Icons(IconSize::SMALL), ZoomTarget::Details),
+            (ZoomTarget::Details(d), false) => ZoomTarget::Details(d.smaller().unwrap_or(d)),
+            (ZoomTarget::Icons(s), true) => ZoomTarget::Icons(s.larger().unwrap_or(s)),
+            (ZoomTarget::Icons(s), false) => s
+                .smaller()
+                // Below the smallest icons: Details at its smallest, so the wheel back up walks
+                // Small → Medium → Large before returning to icons.
+                .map_or(ZoomTarget::Details(DetailsSize::Small), ZoomTarget::Icons),
         };
     }
-    (at != start).then(|| at.map_or(ZoomTarget::Details, ZoomTarget::Icons))
+    (at != start).then_some(at)
 }
 
 impl Explorer {
@@ -230,6 +243,18 @@ impl Explorer {
         self.set_icon_size(size);
         self.set_view_mode(ViewMode::Icons, cx);
         self.remember_folder_view(cx);
+        cx.notify();
+    }
+
+    /// Details item size (a setting shared by all tabs, like density). Applied here at once so the
+    /// rows change on the same frame; the setting follows for the other tabs.
+    pub(crate) fn pick_details_size(&mut self, size: DetailsSize, cx: &mut Context<Self>) {
+        if self.details_size == size {
+            return;
+        }
+        self.details_size = size;
+        crate::settings::SettingsStore::global(cx)
+            .update(cx, |s, cx| s.update(|st| st.details_size = size, cx));
         cx.notify();
     }
 
@@ -286,7 +311,9 @@ impl Explorer {
             return false;
         }
         let notches = match event.delta {
-            ScrollDelta::Lines(p) => p.y,
+            // A notch arrives as the system's lines per notch (3 by default): one notch, one step.
+            #[expect(clippy::cast_precision_loss, reason = "a handful of lines, or u32::MAX for page scrolling")]
+            ScrollDelta::Lines(p) => p.y / crate::win::wheel_scroll_lines() as f32,
             ScrollDelta::Pixels(p) => f32::from(p.y) / PIXELS_PER_STEP,
         };
         self.zoom_accum += notches;
@@ -297,14 +324,18 @@ impl Explorer {
         self.zoom_accum -= whole;
         // Clamped by `zoom` anyway; a wheel never sends anywhere near i32's range.
         let steps = whole.clamp(-16., 16.) as i32;
-        match zoom(self.shown_view(), self.icon_size, steps) {
+        match zoom(self.shown_view(), self.icon_size, self.details_size, steps) {
             Some(ZoomTarget::Icons(size)) => self.pick_icon_size(size, cx),
-            Some(ZoomTarget::Details) if self.search_mode => {
-                self.pick_search_view(ViewMode::Details, cx);
-            }
-            Some(ZoomTarget::Details) => {
-                self.set_view_mode(ViewMode::Details, cx);
-                self.remember_folder_view(cx);
+            Some(ZoomTarget::Details(size)) => {
+                self.pick_details_size(size, cx);
+                if self.shown_view() == ViewMode::Details {
+                    cx.notify();
+                } else if self.search_mode {
+                    self.pick_search_view(ViewMode::Details, cx);
+                } else {
+                    self.set_view_mode(ViewMode::Details, cx);
+                    self.remember_folder_view(cx);
+                }
             }
             None => {}
         }
@@ -353,8 +384,13 @@ impl Explorer {
     }
 
     /// Decode size for grid thumbnails at the current icon size and display scale.
+    /// Large Details rows decode at their thumbnail size instead.
     pub(crate) fn thumbnail_px(&self) -> u32 {
-        arke_core::thumbs::source_size(f32::from(self.tile().image), self.ui_scale)
+        let edge = self
+            .details_metrics()
+            .thumbnail
+            .unwrap_or_else(|| self.tile().image);
+        arke_core::thumbs::source_size(f32::from(edge), self.ui_scale)
     }
 }
 
@@ -364,15 +400,21 @@ mod tests {
 
     #[test]
     fn wheel_steps_through_the_ladder_and_into_details() {
+        use crate::settings::DetailsSize as D;
         use IconSize as S;
         use ZoomTarget as Z;
         let icons = ViewMode::Icons;
+        let zoom = |view, size, steps| zoom(view, size, D::Small, steps);
         assert_eq!(zoom(icons, S::LARGE, 1), Some(Z::Icons(S::from_px(96.))));
         assert_eq!(zoom(icons, S::LARGE, -1), Some(Z::Icons(S::from_px(80.))));
         assert_eq!(zoom(icons, S::MEDIUM, -1), Some(Z::Icons(S::SMALL)));
-        assert_eq!(zoom(icons, S::SMALL, -1), Some(Z::Details));
+        assert_eq!(zoom(icons, S::SMALL, -1), Some(Z::Details(D::Small)));
         assert_eq!(zoom(icons, S::EXTRA_LARGE, 1), None, "largest already");
-        assert_eq!(zoom(icons, S::LARGE, -9), Some(Z::Details), "clamped");
+        assert_eq!(
+            zoom(icons, S::LARGE, -9),
+            Some(Z::Details(D::Small)),
+            "clamped"
+        );
         assert_eq!(zoom(icons, S::LARGE, 40), Some(Z::Icons(S::EXTRA_LARGE)));
         assert_eq!(zoom(icons, S::MEDIUM, 0), None);
         // A slider size between stops goes to the next stop either way.
@@ -380,9 +422,25 @@ mod tests {
         assert_eq!(zoom(icons, between, 1), Some(Z::Icons(S::from_px(96.))));
         assert_eq!(zoom(icons, between, -1), Some(Z::Icons(S::from_px(80.))));
         let details = ViewMode::Details;
-        assert_eq!(zoom(details, S::EXTRA_LARGE, 1), Some(Z::Icons(S::SMALL)));
-        assert_eq!(zoom(details, S::LARGE, -1), None, "Details is the smallest");
-        assert_eq!(zoom(details, S::LARGE, 2), Some(Z::Icons(S::MEDIUM)));
+        assert_eq!(
+            zoom(details, S::EXTRA_LARGE, 1),
+            Some(Z::Details(D::Medium))
+        );
+        assert_eq!(
+            zoom(details, S::LARGE, -1),
+            None,
+            "small Details is the smallest"
+        );
+        assert_eq!(zoom(details, S::LARGE, 3), Some(Z::Icons(S::SMALL)));
+        assert_eq!(zoom(details, S::LARGE, 4), Some(Z::Icons(S::MEDIUM)));
+        assert_eq!(
+            super::zoom(details, S::LARGE, D::Large, -1),
+            Some(Z::Details(D::Medium))
+        );
+        assert_eq!(
+            super::zoom(details, S::LARGE, D::Large, 1),
+            Some(Z::Icons(S::SMALL))
+        );
         assert_eq!(zoom(ViewMode::Columns, S::LARGE, 1), None);
     }
 

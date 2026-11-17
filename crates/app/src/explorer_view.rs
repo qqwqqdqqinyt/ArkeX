@@ -217,7 +217,7 @@ impl Explorer {
             }))
             .overflow_hidden()
             .when(collapsed, |d| d.tooltip_below(t!("filter.placeholder")))
-            .h(theme::H_CTL)
+            .h(theme::H_TOP)
             .flex()
             .items_center()
             .gap(theme::S_6)
@@ -263,13 +263,13 @@ impl Explorer {
         div()
             .relative()
             .w(if collapsed {
-                theme::H_CTL
+                theme::H_TOP
             } else if self.pane.split {
                 px(150.)
             } else {
                 theme::FILTER_W
             })
-            .min_w(theme::H_CTL)
+            .min_w(theme::H_TOP)
             .when(!self.pane.split, gpui::Styled::flex_none)
             .mr(theme::S_8)
             .child(filter_box)
@@ -781,7 +781,7 @@ impl Explorer {
                 },
             )
             // Click without drag: in a multi-selection, select only this item.
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.on_row_click(ix, event, cx) {
                     return;
                 }
@@ -791,6 +791,17 @@ impl Explorer {
                         this.selection.select_only(&view, ix);
                         cx.notify();
                     }
+                }
+                // Clicked the item that was already the only selection: rename after the
+                // double-click time unless something cancels it (Explorer's slow click).
+                if !event.is_keyboard() && event.click_count() == 1 {
+                    this.slow_click_release(ix, window, cx);
+                }
+            }))
+            // Leaving the item while the slow-click wait runs cancels it.
+            .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
+                if !*hovered {
+                    this.slow_click_leave(ix);
                 }
             }))
             // Drop: folders
@@ -918,7 +929,14 @@ impl Explorer {
         let single = self.selection.len() <= 1;
         let visible = names_in(&entries, range.clone());
         let cut = self.cut_flags(&visible, cx);
-        let images = self.media_for(&entries, range.clone(), false, Vec::new(), cx);
+        let metrics = self.details_metrics();
+        let images = self.media_for(
+            &entries,
+            range.clone(),
+            metrics.thumbnail.is_some(),
+            Vec::new(),
+            cx,
+        );
         let renaming = self
             .renaming
             .as_ref()
@@ -958,7 +976,24 @@ impl Explorer {
                             .child(self.tree_lead(
                                 ix,
                                 entry,
-                                listed_visual(shares, entry, image, theme::ICON, theme::ICON),
+                                {
+                                    // Same edge for files and folders (one size per Details size).
+                                    let icon = if entry.is_dir_like() {
+                                        metrics.folder
+                                    } else {
+                                        metrics.icon
+                                    };
+                                    let picture = metrics.thumbnail.unwrap_or(icon);
+                                    // One slot width for every row, so names stay aligned.
+                                    div()
+                                        .w(metrics.thumbnail.unwrap_or(metrics.folder))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(listed_visual(shares, entry, image, picture, icon))
+                                        .into_any_element()
+                                },
                                 cx,
                             ))
                             .child(self.name_column(
@@ -992,7 +1027,11 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> Vec<Option<Arc<RenderImage>>> {
         let images = self.file_media(entries, range.clone(), thumbnails, extra, cx);
-        let large = thumbnails && self.tile().icon > px(32.);
+        let large = thumbnails
+            && self
+                .details_metrics()
+                .thumbnail
+                .map_or_else(|| self.tile().icon > px(32.), |_| true);
         self.with_type_icons(entries, range, images, large, cx)
     }
 
@@ -1088,15 +1127,17 @@ impl Explorer {
             .collect()
     }
 
-    /// Icons view from medium size up: for each visible folder, the media key of its first
-    /// picture (once the background lookup found one), and those keys again for the media queue.
-    /// Small icons, Details and Columns keep the plain folder.
+    /// Icons view from medium size up: for each visible folder with a picture inside (once the
+    /// background lookup found one), what to draw it with, and the keys for the media queue.
+    /// With Windows type icons and Shell thumbnails on, that's the Shell's own folder thumbnail
+    /// (like File Explorer), falling back to Arke's layered folder with the first picture when the
+    /// Shell gives none. Small icons, Details and Columns keep the plain folder.
     fn folder_peeks(
         &mut self,
         entries: &[Entry],
         range: Range<usize>,
         cx: &mut Context<Self>,
-    ) -> (Vec<Option<MediaKey>>, Vec<MediaKey>) {
+    ) -> (Vec<Option<Peek>>, Vec<MediaKey>) {
         let tile = self.tile();
         if self.view_mode != ViewMode::Icons
             || !self.show_thumbnails
@@ -1112,21 +1153,40 @@ impl Explorer {
         }
         // The picture sits inside the folder icon, so it's decoded for the icon's size.
         let px = arke_core::thumbs::source_size(f32::from(tile.icon), self.ui_scale);
-        let folders: Vec<Option<PeekKey>> = range
-            .map(|ix| entries.get(ix).and_then(|e| PeekKey::for_entry(&dir, e)))
+        let system = crate::prefs::system_type_icons() && crate::media::shell_thumbnails_enabled();
+        let folders: Vec<Option<(PeekKey, &Entry)>> = range
+            .map(|ix| {
+                let e = entries.get(ix)?;
+                PeekKey::for_entry(&dir, e).map(|k| (k, e))
+            })
             .collect();
         self.media.update(cx, |m, _| {
-            m.want_peeks(folders.iter().flatten().cloned().collect());
-            let keys: Vec<Option<MediaKey>> = folders
+            m.want_peeks(folders.iter().flatten().map(|(k, _)| k.clone()).collect());
+            let mut wanted = Vec::new();
+            let peeks: Vec<Option<Peek>> = folders
                 .iter()
                 .map(|folder| {
-                    let folder = folder.as_ref()?;
+                    let (folder, entry) = folder.as_ref()?;
                     let first = m.peek(folder)?;
-                    MediaKey::at(folder.dir.join(&*first.name), first, Some(px))
+                    if system {
+                        let shell = MediaKey::shell_folder(folder.dir.clone(), entry, px);
+                        match m.settled(&shell) {
+                            Some(Some(image)) => return Some(Peek::Shell(Arc::clone(image))),
+                            // Not drawn yet: the plain folder until Windows answers, so the icon
+                            // doesn't switch style twice.
+                            None => {
+                                wanted.push(shell);
+                                return None;
+                            }
+                            Some(None) => {}
+                        }
+                    }
+                    let key = MediaKey::at(folder.dir.join(&*first.name), first, Some(px))?;
+                    wanted.push(key.clone());
+                    m.get_or_nearby(&key).map(Peek::Picture)
                 })
                 .collect();
-            let wanted = keys.iter().flatten().cloned().collect();
-            (keys, wanted)
+            (peeks, wanted)
         })
     }
 
@@ -1140,7 +1200,9 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(layout) = self.cached_grid() else {
-            return range.map(|_| div().h(grid::SLOT).into_any_element()).collect();
+            return range
+                .map(|_| div().h(grid::SLOT).into_any_element())
+                .collect();
         };
         let first = range.start;
         // Bands that start in the range, plus the one cut by its top edge.
@@ -1165,7 +1227,8 @@ impl Explorer {
         range
             .map(|slot| {
                 let Some(b) = drawn.peek().copied().filter(|b| {
-                    layout.bands[*b].slot == slot || (slot == first && layout.band_at_slot(slot) == Some(*b))
+                    layout.bands[*b].slot == slot
+                        || (slot == first && layout.band_at_slot(slot) == Some(*b))
                 }) else {
                     return div().h(grid::SLOT).into_any_element();
                 };
@@ -1177,7 +1240,9 @@ impl Explorer {
                         label,
                         start,
                         count,
-                    } => self.group_header(b, label.clone(), *start, *count, Some(band.height()), cx),
+                    } => {
+                        self.group_header(b, label.clone(), *start, *count, Some(band.height()), cx)
+                    }
                     grid::Band::Row(_) => tiles.next().unwrap_or_else(|| div().into_any_element()),
                 };
                 div()
@@ -1287,13 +1352,7 @@ impl Explorer {
         let cut = self.cut_flags(&names, cx);
         let (peek_keys, peek_media) = self.folder_peeks(&entries, start..end, cx);
         let images = self.media_for(&entries, start..end, true, peek_media, cx);
-        let peeks: Vec<Option<Arc<RenderImage>>> = {
-            let media = self.media.read(cx);
-            peek_keys
-                .iter()
-                .map(|k| k.as_ref().and_then(|k| media.get_or_nearby(k)))
-                .collect()
-        };
+        let peeks = peek_keys;
         let cursor = self.cursor;
         let shares = lists_shares(self.current_path());
         let single = self.selection.len() <= 1;
@@ -1325,14 +1384,14 @@ impl Explorer {
                             // Wraps like Explorer, up to three lines; a longer name ends in "…"
                             // on the last one.
                             None => div()
-                            .w_full()
-                            .text_center()
-                            .line_clamp(usize::from(grid::MAX_LINES))
-                            .text_ellipsis()
-                            .text_size(grid::LABEL_SIZE)
-                            .line_height(grid::LABEL_LINE)
-                            .child(shown_name(entry, self.show_extensions))
-                            .into_any_element(),
+                                .w_full()
+                                .text_center()
+                                .line_clamp(usize::from(grid::MAX_LINES))
+                                .text_ellipsis()
+                                .text_size(grid::LABEL_SIZE)
+                                .line_height(grid::LABEL_LINE)
+                                .child(shown_name(entry, self.show_extensions))
+                                .into_any_element(),
                         };
                         // Folder compare badge in the tile's top-right
                         let badge = super::compare::compare_badge(self.compare_mark(&entry.name))
@@ -1383,8 +1442,11 @@ impl Explorer {
                                     .items_center()
                                     .justify_center()
                                     .child(match peek {
-                                        Some(picture) if !shares => {
+                                        Some(Peek::Picture(picture)) if !shares => {
                                             peek_folder_visual(entry, picture, tile.icon)
+                                        }
+                                        Some(Peek::Shell(image)) if !shares => {
+                                            shell_folder_visual(entry, image, tile.icon)
                                         }
                                         _ => listed_visual(
                                             shares, entry, image, tile.image, tile.icon,
@@ -1762,7 +1824,12 @@ impl Explorer {
 
     /// Search results as tiles (Icons view): rows of [`Self::tile`]-sized tiles, names on up to
     /// two lines, each tile clickable like a result row.
-    fn search_grid_list(&mut self, len: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn search_grid_list(
+        &mut self,
+        len: usize,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let measured = self.list_bounds.get().size.width;
         let avail = if measured > px(0.) {
             measured - SCROLLBAR_GUTTER
@@ -1809,7 +1876,14 @@ impl Explorer {
             })
             .collect();
         let images = {
-            let images = self.file_media_in(&results.root, &entries, 0..entries.len(), true, Vec::new(), cx);
+            let images = self.file_media_in(
+                &results.root,
+                &entries,
+                0..entries.len(),
+                true,
+                Vec::new(),
+                cx,
+            );
             let large = self.tile().icon > px(32.);
             self.with_type_icons(&entries, 0..entries.len(), images, large, cx)
         };
@@ -1847,7 +1921,9 @@ impl Explorer {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(listed_visual(false, entry, image, tile.image, tile.icon)),
+                                    .child(listed_visual(
+                                        false, entry, image, tile.image, tile.icon,
+                                    )),
                             )
                             .child(
                                 div()
@@ -2030,6 +2106,13 @@ impl Explorer {
                 accept_drops_into(d, here, cx)
             })
             .on_action(cx.listener(Self::open_context_menu_action))
+            // Any key, or scrolling the list, ends a pending slow-click rename.
+            .capture_key_down(cx.listener(|this, _: &gpui::KeyDownEvent, _, _| {
+                this.slow_click_cancel();
+            }))
+            .on_scroll(cx.listener(|this, _: &gpui::ScrollEvent, _, _| {
+                this.slow_click_cancel();
+            }))
             .on_key_down(cx.listener(Self::on_list_key_down))
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::select_next))
@@ -2552,7 +2635,7 @@ pub(crate) fn ghost_button_turned(
         .id(id)
         .a11y_button(tip.clone())
         .a11y_disabled(!enabled)
-        .size(theme::H_CTL)
+        .size(theme::H_TOP)
         .flex()
         .flex_none()
         .items_center()
@@ -3088,7 +3171,9 @@ fn plain_visual(
 ) -> AnyElement {
     if let Some(image) = image {
         // System and type icons keep icon size; thumbnails fill the image area.
-        let size = if image.size(0).width.0 <= 64 || crate::media::is_type_icon(&image) {
+        let edge = image.size(0);
+        // The longer side, so a tall picture's narrow thumbnail isn't taken for an icon.
+        let size = if edge.width.0.max(edge.height.0) <= 64 || crate::media::is_type_icon(&image) {
             icon_size
         } else {
             image_size
@@ -3103,6 +3188,57 @@ fn plain_visual(
     kind_icon(file_kind(entry), icon_size)
 }
 
+/// Picture frame of a folder peek on the 16-unit canvas of `folder-lg-*.svg`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PeekFrame {
+    pub(crate) left: f32,
+    pub(crate) top: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+}
+
+/// Where the picture sits between the folder's back and front panels.
+pub(crate) const PEEK_FRAME: PeekFrame = PeekFrame {
+    left: 2.4,
+    top: 3.4,
+    w: 11.2,
+    h: 7.8,
+};
+
+/// Top edge of the front panel (and its lit lip) in `folder-lg-front.svg` / `folder-lg-lip.svg`.
+/// Keep in step with the SVGs (a test checks).
+pub(crate) const FOLDER_FRONT_TOP: f32 = 8.5;
+
+/// Share of the picture frame above the front panel: (front top − frame top) ÷ frame height.
+/// About 65%, like File Explorer's folder thumbnails (was 33% with the front at 6.3 and the frame
+/// 3.5 + 8.5).
+pub(crate) fn peek_reveal(frame: PeekFrame, front_top: f32) -> f32 {
+    ((front_top - frame.top) / frame.h).clamp(0., 1.)
+}
+
+/// How an Icons-view folder with a picture inside is drawn.
+#[derive(Clone)]
+pub(crate) enum Peek {
+    /// Arke's layered folder with this picture between the layers.
+    Picture(Arc<RenderImage>),
+    /// The Windows Shell's own folder thumbnail, drawn as is.
+    Shell(Arc<RenderImage>),
+}
+
+/// A folder drawn with the Shell's folder thumbnail (Windows composes the folder and its
+/// pictures), fitted in the icon square.
+fn shell_folder_visual(entry: &Entry, image: Arc<RenderImage>, size: Pixels) -> AnyElement {
+    let visual = div()
+        .size(size)
+        .flex_none()
+        .child(img(image).size_full().object_fit(ObjectFit::Contain))
+        .into_any_element();
+    if entry.is_link() {
+        return super::details::with_link_badge(visual, size);
+    }
+    visual
+}
+
 /// A folder in the Icons view with its first picture showing through, like Explorer: back panel,
 /// the picture, then the front panel over the picture's lower part so only its top edge shows.
 fn peek_folder_visual(entry: &Entry, picture: Arc<RenderImage>, size: Pixels) -> AnyElement {
@@ -3115,8 +3251,12 @@ fn peek_folder_visual(entry: &Entry, picture: Arc<RenderImage>, size: Pixels) ->
             .path(icon.path())
             .text_color(color)
     };
-    // Positions on the icons' 16-unit canvas (`folder-lg-*.svg`): the front panel starts at 6.3.
+    // Positions on the icons' 16-unit canvas (`folder-lg-*.svg`), see [`PEEK_FRAME`].
     let unit = size * (1. / 16.);
+    debug_assert!(
+        peek_reveal(PEEK_FRAME, FOLDER_FRONT_TOP) < 1.,
+        "the front covers the picture's foot"
+    );
     let (_, front) = theme::folder_colors();
     let (deep, _, lip) = theme::folder_depth_colors();
     let visual = div()
@@ -3127,10 +3267,10 @@ fn peek_folder_visual(entry: &Entry, picture: Arc<RenderImage>, size: Pixels) ->
         .child(
             div()
                 .absolute()
-                .left(unit * 2.4)
-                .top(unit * 3.5)
-                .w(unit * 11.2)
-                .h(unit * 8.5)
+                .left(unit * PEEK_FRAME.left)
+                .top(unit * PEEK_FRAME.top)
+                .w(unit * PEEK_FRAME.w)
+                .h(unit * PEEK_FRAME.h)
                 .rounded(unit * 0.6)
                 .overflow_hidden()
                 .child(img(picture).size_full().object_fit(ObjectFit::Cover)),
@@ -3692,4 +3832,30 @@ impl Explorer {
 fn sideways_is_not_down(mut list: gpui::UniformList) -> gpui::UniformList {
     list.style().restrict_scroll_to_axis = Some(true);
     list
+}
+
+#[cfg(test)]
+mod peek_tests {
+    use super::{FOLDER_FRONT_TOP, PEEK_FRAME, peek_reveal};
+
+    /// The front panel's top edge as drawn: the path starts at `M1.5 y` one corner radius (1.1)
+    /// below it.
+    fn front_top(svg: &str) -> f32 {
+        let start = svg.find("d=\"M1.5 ").map_or(0, |i| i + 8);
+        let y: String = svg[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        y.parse::<f32>().unwrap_or_default() - 1.1
+    }
+
+    #[test]
+    fn folder_peek_shows_about_two_thirds_of_the_picture() {
+        let front = include_str!("../assets/icons/folder-lg-front.svg");
+        let lip = include_str!("../assets/icons/folder-lg-lip.svg");
+        assert!((front_top(front) - FOLDER_FRONT_TOP).abs() < 1e-3);
+        assert!((front_top(lip) - FOLDER_FRONT_TOP).abs() < 1e-3);
+        let reveal = peek_reveal(PEEK_FRAME, FOLDER_FRONT_TOP);
+        assert!((0.62..=0.68).contains(&reveal), "{reveal}");
+    }
 }

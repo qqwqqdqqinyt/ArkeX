@@ -3538,19 +3538,28 @@ fn grid_view_loads_thumbnails_and_icons_without_blocking(cx: &mut TestAppContext
         (PathBuf::from(r"C:\pics\app.exe"), MediaKind::SystemIcon),
         (PathBuf::from(r"C:\pics\b.png"), MediaKind::Thumbnail),
     ];
+    // System icons load at each size they're drawn at (one key per size): count each item once.
+    let media = |view: &Entity<Explorer>, cx: &mut VisualTestContext| {
+        let mut m = loaded_media(view, cx);
+        m.dedup();
+        m
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
-    while loaded_media(&view, cx) != expected {
+    while media(&view, cx) != expected {
         assert!(
             Instant::now() < deadline,
             "thumbnails not loaded: {:?}",
-            loaded_media(&view, cx)
+            media(&view, cx)
         );
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         std::thread::sleep(Duration::from_millis(5));
     }
+    let mut icons = shell.icons.lock().clone();
+    icons.sort();
+    icons.dedup();
     assert_eq!(
-        shell.icons.lock().as_slice(),
+        icons.as_slice(),
         [PathBuf::from(r"C:\pics\app.exe")],
         "only .exe/.lnk/.ico should get system icons"
     );
@@ -3559,11 +3568,15 @@ fn grid_view_loads_thumbnails_and_icons_without_blocking(cx: &mut TestAppContext
     view.update(cx, |v, _| assert!(v.grid_cols > 1));
     cx.simulate_keystrokes("home right");
     assert_eq!(view.update(cx, |v, _| v.cursor), Some(1));
+    // ArkeX tiles are wider and fewer per row; the rule stays: down goes one row down, a row past
+    // the end stops at the last item, and with every item on one row it stays put.
+    let cols = view.update(cx, |v, _| v.grid_cols);
+    let expected = if cols < 5 { (1 + cols).min(4) } else { 1 };
     cx.simulate_keystrokes("down");
     assert_eq!(
         view.update(cx, |v, _| v.cursor),
-        Some(4),
-        "down a row past the end should stop at the last item"
+        Some(expected),
+        "down from the second item with {cols} columns"
     );
     cx.simulate_keystrokes("ctrl-shift-6 down");
     assert_eq!(
@@ -6578,6 +6591,9 @@ fn filter_menu_closes_on_a_press_outside(cx: &mut TestAppContext) {
     wait_until(cx, &view, "load", loaded(r"C:\k"));
     cx.dispatch_action(FocusFilter);
     cx.run_until_parked();
+    // The search panel opens when asked (ArkeX): Tab from the box goes into it.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
     let menu = |cx: &mut VisualTestContext| {
         cx.update(|window, cx| view.update(cx, |v, _| v.panel_state_for_test(window).2))
             .map(|(facet, _)| facet)
@@ -6640,4 +6656,19 @@ fn a_menu_taller_than_the_window_scrolls(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let (_, offset) = panel(cx);
     assert!(offset < px(0.), "scrolled down to the last row: {offset:?}");
+}
+
+/// ArkeX default (Settings → Search, subfolders on): typing in the box searches subfolders; with
+/// the option off it filters this folder, as upstream does.
+#[gpui::test]
+fn typing_searches_subfolders_when_the_option_is_on(cx: &mut TestAppContext) {
+    use crate::explorer::scope::Scope;
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\o", vec![file("a.txt", 1)]);
+    let (view, cx) = setup(cx, fs, Arc::default(), r"C:\o");
+    wait_until(cx, &view, "load", loaded(r"C:\o"));
+    assert_eq!(view.update(cx, |v, _| v.typing_scope()), Scope::Here);
+    crate::prefs::set_search_subfolders_for_test(true);
+    assert_eq!(view.update(cx, |v, _| v.typing_scope()), Scope::Subfolders);
+    crate::prefs::set_search_subfolders_for_test(false);
 }

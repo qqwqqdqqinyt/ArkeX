@@ -22,7 +22,7 @@ use rust_i18n::t;
 use super::{Explorer, IconSize, ViewColumns, ViewDetails, ViewMode};
 use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
-use crate::settings::{Density, Settings};
+use crate::settings::{Density, DetailsSize, Settings};
 use crate::theme;
 use crate::workspace::TooltipBelowExt as _;
 
@@ -164,6 +164,7 @@ impl Explorer {
             )
     }
 
+    #[expect(clippy::too_many_lines, reason = "one panel, laid out top to bottom")]
     fn view_options_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let mode = self.view_mode;
         let settings = crate::settings::SettingsStore::global(cx)
@@ -200,8 +201,16 @@ impl Explorer {
         let size_block = match mode {
             ViewMode::Icons => Some(self.icon_size_block(cx)),
             // Split panes always use compact rows.
-            ViewMode::Details if !self.pane.split => Some(density_block(settings.density)),
-            ViewMode::Details | ViewMode::Columns => None,
+            ViewMode::Details if !self.pane.split => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(details_size_block(settings.details_size))
+                    .child(density_block(settings.density))
+                    .into_any_element(),
+            ),
+            ViewMode::Details => Some(details_size_block(settings.details_size)),
+            ViewMode::Columns => None,
         };
         let mut toggles: Vec<AnyElement> = Vec::new();
         if mode != ViewMode::Columns {
@@ -383,6 +392,69 @@ fn layout_tile(
 }
 
 /// Details: row density as three text segments (the same setting as in Settings).
+/// Details item size: small, medium, and large rows with thumbnails (Ctrl+wheel steps through them
+/// too, on to small icons).
+fn details_size_block(size: DetailsSize) -> AnyElement {
+    let option = |value: DetailsSize, label: std::borrow::Cow<'static, str>| {
+        let active = value == size;
+        let label = label.into_owned();
+        div()
+            .id(("vo-details-size", value as usize))
+            .a11y(gpui::Role::RadioButton, label.clone())
+            .aria_toggled(crate::a11y::toggled(active))
+            .flex_1()
+            .min_w_0()
+            .h(SEGMENT_H)
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(theme::R_4)
+            .cursor_pointer()
+            .text_size(theme::FS_12)
+            .when(active, |d| {
+                d.bg(theme::segment_thumb())
+                    .shadow(theme::elev_thumb())
+                    .text_color(theme::text())
+            })
+            .when(!active, |d| {
+                d.text_color(theme::text_muted())
+                    .hover(|s| s.bg(theme::wash()))
+            })
+            .child(div().truncate().child(label))
+            .on_click(move |_, _, cx| set(cx, |st| st.details_size = value))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(theme::S_6)
+        .pt(theme::S_8)
+        .child(
+            div()
+                .px(theme::S_8)
+                .child(t!("view.details_size").into_owned()),
+        )
+        .child(
+            div()
+                .mx(theme::S_8)
+                .flex()
+                .gap(theme::S_2)
+                .p(theme::S_2)
+                .rounded(theme::R_8)
+                .bg(theme::segment_track())
+                .children(DetailsSize::ALL.map(|value| {
+                    option(
+                        value,
+                        match value {
+                            DetailsSize::Small => t!("details_size.small"),
+                            DetailsSize::Medium => t!("details_size.medium"),
+                            DetailsSize::Large => t!("details_size.large"),
+                        },
+                    )
+                })),
+        )
+        .into_any_element()
+}
+
 fn density_block(density: Density) -> AnyElement {
     let option = |value: Density, label: std::borrow::Cow<'static, str>| {
         let active = value == density;

@@ -24,8 +24,7 @@ gpui-pre) and at <https://www.apache.org/licenses/LICENSE-2.0>
 The sidebar (place rows, collapsible section headings, drive rows with free space and a usage
 bar), the side preview's layout (header first, hover actions, empty state, details list), the
 item highlight and the resizable sidebar follow Atlas; these layouts were re-implemented on
-Arke's GPUI version. The folder picture ring in the preview pane (`crates/app/src/dir_ring.rs`)
-is adapted from Atlas's `dir_ring.rs`; the file header notes the source.
+Arke's GPUI version.
 
 ## Phosphor Icons (2.1.1, regular weight)
 

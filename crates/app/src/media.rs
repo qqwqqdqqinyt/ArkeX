@@ -113,6 +113,18 @@ impl MediaKey {
         Self::with_icon(path, entry, thumbnail_px, icon_px)
     }
 
+    /// The Shell's own thumbnail of a folder (the folder icon with its pictures inside, drawn by
+    /// Windows the way File Explorer shows it). `entry` is the folder's listing entry.
+    pub(crate) const fn shell_folder(path: PathBuf, entry: &Entry, px: u32) -> Self {
+        Self {
+            path,
+            modified: entry.modified,
+            size: entry.size,
+            kind: MediaKind::ShellThumbnail,
+            px,
+        }
+    }
+
     fn with_icon(
         path: PathBuf,
         entry: &Entry,
@@ -464,6 +476,12 @@ impl MediaStore {
     /// Loaded image (`None` if failed or not loaded yet).
     pub(crate) fn get(&self, key: &MediaKey) -> Option<Arc<RenderImage>> {
         self.cache.get(key).cloned().flatten()
+    }
+
+    /// Whether this key finished loading: `Some(image)` loaded, `Some(None)` failed, `None` not
+    /// loaded yet.
+    pub(crate) fn settled(&self, key: &MediaKey) -> Option<&Option<Arc<RenderImage>>> {
+        self.cache.get(key)
     }
 
     /// Like [`Self::get`], but while a thumbnail isn't loaded at this size yet, the same file's

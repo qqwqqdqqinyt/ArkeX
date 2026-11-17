@@ -43,7 +43,6 @@ mod brand;
 mod build_info;
 mod cloud_places;
 mod crashlog;
-mod dir_ring;
 mod explorer;
 mod folder_handler;
 mod folder_views;

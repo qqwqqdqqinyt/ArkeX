@@ -1529,7 +1529,10 @@ impl Workspace {
         let mut files = regroup(
             files,
             &[
-                (Some(t!("settings.group_show")), &[0, 2, 1, 5, 6, 7, 8, 9, 10]),
+                (
+                    Some(t!("settings.group_show")),
+                    &[0, 2, 1, 5, 6, 7, 8, 9, 10],
+                ),
                 (
                     Some(t!("settings.group_behavior")),
                     &[4, 3, 13, 14, 15, 16, 17],

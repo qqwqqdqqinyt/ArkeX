@@ -205,8 +205,14 @@ mod tests {
             !can_shell_thumbnail(&file("a.png", 10)),
             "decoded in Rust instead"
         );
-        assert!(can_shell_thumbnail(&file("clip.mp4", 10)), "any format with a provider");
-        assert!(!can_shell_thumbnail(&file("app.exe", 10)), "system icon instead");
+        assert!(
+            can_shell_thumbnail(&file("clip.mp4", 10)),
+            "any format with a provider"
+        );
+        assert!(
+            !can_shell_thumbnail(&file("app.exe", 10)),
+            "system icon instead"
+        );
         let online_only = Entry::new("a.psd", EntryKind::File, 1000, None, 0x40_0000);
         assert!(!can_shell_thumbnail(&online_only));
         let dir = Entry::new("x.psd", EntryKind::Dir, 0, None, 0);

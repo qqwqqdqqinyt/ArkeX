@@ -392,6 +392,22 @@ view.icon_px:
   en: "%{px} px"
   zh-TW: "%{px} px"
   zh-CN: "%{px} px"
+view.details_size:
+  en: Size
+  zh-TW: 項目大小
+  zh-CN: 项目大小
+details_size.small:
+  en: Small
+  zh-TW: 小
+  zh-CN: 小
+details_size.medium:
+  en: Medium
+  zh-TW: 中
+  zh-CN: 中
+details_size.large:
+  en: Large
+  zh-TW: 大（縮圖）
+  zh-CN: 大（缩略图）
 view.density:
   en: Density
   zh-TW: 清單密度

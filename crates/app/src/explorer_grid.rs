@@ -187,23 +187,24 @@ impl GridLayout {
         let mut bands = Vec::new();
         let mut band_of = vec![0u32; len];
         let mut slot = 0usize;
-        let mut push_rows = |start: usize, end: usize, bands: &mut Vec<Placed>, slot: &mut usize| {
-            let mut at = start;
-            while at < end {
-                let stop = (at + cols.n).min(end);
-                let tallest = lines[at..stop].iter().copied().max().unwrap_or(1);
-                let slots = slots_for(tile_height(tile, tallest));
-                let b = u32::try_from(bands.len()).unwrap_or(u32::MAX);
-                band_of[at..stop].fill(b);
-                bands.push(Placed {
-                    band: Band::Row(at..stop),
-                    slot: *slot,
-                    slots,
-                });
-                *slot += slots;
-                at = stop;
-            }
-        };
+        let mut push_rows =
+            |start: usize, end: usize, bands: &mut Vec<Placed>, slot: &mut usize| {
+                let mut at = start;
+                while at < end {
+                    let stop = (at + cols.n).min(end);
+                    let tallest = lines[at..stop].iter().copied().max().unwrap_or(1);
+                    let slots = slots_for(tile_height(tile, tallest));
+                    let b = u32::try_from(bands.len()).unwrap_or(u32::MAX);
+                    band_of[at..stop].fill(b);
+                    bands.push(Placed {
+                        band: Band::Row(at..stop),
+                        slot: *slot,
+                        slots,
+                    });
+                    *slot += slots;
+                    at = stop;
+                }
+            };
         match sections {
             Some(sections) => {
                 let header = slots_for(HEADER_H);
@@ -377,9 +378,7 @@ pub(crate) fn measure_lines<S: AsRef<str>>(
                 .wrap_line(&fragments, width, gpui::IndentAdjustment::default())
                 .take(usize::from(MAX_LINES))
                 .count();
-            u8::try_from(breaks + 1)
-                .unwrap_or(MAX_LINES)
-                .min(MAX_LINES)
+            u8::try_from(breaks + 1).unwrap_or(MAX_LINES).min(MAX_LINES)
         })
         .collect()
 }
@@ -431,8 +430,14 @@ mod tests {
         let tile = theme::TILE_LARGE;
         let grid = GridLayout::new(key(cols), tile, lines, None);
         assert_eq!(grid.bands.len(), 2);
-        assert_eq!(grid.bands[0].height(), SLOT * slots_for(tile_height(tile, 3)) as f32);
-        assert_eq!(grid.bands[1].height(), SLOT * slots_for(tile_height(tile, 2)) as f32);
+        assert_eq!(
+            grid.bands[0].height(),
+            SLOT * slots_for(tile_height(tile, 3)) as f32
+        );
+        assert_eq!(
+            grid.bands[1].height(),
+            SLOT * slots_for(tile_height(tile, 2)) as f32
+        );
         assert_eq!(grid.bands[1].slot, grid.bands[0].slots);
         // Drawn tile 5 (row 1, column 1) is hit where it is drawn.
         let b = grid.tile_bounds(5).expect("tile");
@@ -440,9 +445,15 @@ mod tests {
         assert_eq!(grid.hit(point(b.left() - px(1.), b.top() + px(4.))), None);
         // A short name leaves blank space under it in a tall row.
         let short = grid.tile_bounds(0).expect("tile");
-        assert_eq!(grid.hit(point(short.left() + px(4.), short.bottom() + px(2.))), None);
+        assert_eq!(
+            grid.hit(point(short.left() + px(4.), short.bottom() + px(2.))),
+            None
+        );
         let row0 = short.top();
-        assert_eq!(grid.hits_in(px(0.), px(449.), row0, row0 + px(1.)), vec![0, 1, 2, 3]);
+        assert_eq!(
+            grid.hits_in(px(0.), px(449.), row0, row0 + px(1.)),
+            vec![0, 1, 2, 3]
+        );
         assert_eq!(grid.step(1, 1), 5);
         assert_eq!(grid.step(2, 1), 5);
     }

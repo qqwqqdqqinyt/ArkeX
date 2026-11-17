@@ -292,6 +292,82 @@ const fn glyph_for(command: MenuCommand) -> Option<Icon> {
     })
 }
 
+/// Menu icon tone: blue-gray for almost everything, steel blue as a sparing accent, amber only for
+/// folders. Delete, undo and pin stay in the main tone too: the menu reads calm, not alarmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Main,
+    Steel,
+    Amber,
+}
+
+const fn tone_for(command: MenuCommand) -> Tone {
+    use MenuCommand as C;
+    match command {
+        C::NewTextFile
+        | C::NewFileIn
+        | C::ViewDetails
+        | C::ViewIcons
+        | C::ViewColumns
+        | C::CopyPath
+        | C::CopyRelativePath => Tone::Steel,
+        C::NewFolder
+        | C::NewFolderIn
+        | C::MoveToNewFolder
+        | C::RevealInExplorer
+        | C::OpenFileLocation => Tone::Amber,
+        _ => Tone::Main,
+    }
+}
+
+fn tone_color(tone: Tone) -> gpui::Rgba {
+    match tone {
+        Tone::Main => theme::tone_main(),
+        Tone::Steel => theme::tone_steel(),
+        Tone::Amber => theme::tone_amber(),
+    }
+}
+
+/// A menu icon in its tone, faded like the label when disabled. Two-tone icons are separate
+/// layers stacked in one cell: Sort's down arrow in steel, New folder's plus in deeper amber.
+fn menu_glyph(glyph: Icon, tone: Tone, enabled: bool, size: Pixels) -> AnyElement {
+    let shade = |c: gpui::Rgba| if enabled { c } else { theme::disabled_tone(c) };
+    let layer = |icon: Icon, color: gpui::Rgba| {
+        svg()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size(size)
+            .path(icon.path())
+            .text_color(shade(color))
+    };
+    let layers = match glyph {
+        Icon::Sort => Some([
+            (Icon::SortUp, tone_color(tone)),
+            (Icon::SortDown, theme::tone_steel()),
+        ]),
+        Icon::FolderPlus => Some([
+            (Icon::FolderPlusBody, tone_color(tone)),
+            (Icon::FolderPlusMark, theme::tone_amber_deep()),
+        ]),
+        _ => None,
+    };
+    match layers {
+        Some(layers) => div()
+            .relative()
+            .size(size)
+            .flex_none()
+            .children(layers.map(|(icon, color)| layer(icon, color)))
+            .into_any_element(),
+        None => svg()
+            .path(glyph.path())
+            .size(size)
+            .flex_none()
+            .text_color(shade(tone_color(tone)))
+            .into_any_element(),
+    }
+}
+
 /// Adds icons to Arke's own items; items read from Windows bring their own.
 fn decorate(entries: &mut [MenuEntry]) {
     for entry in entries {
@@ -738,6 +814,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.slow_click_cancel();
         if self.renaming.is_some() {
             return;
         }
@@ -1841,7 +1918,11 @@ impl Explorer {
     ) {
         use MenuCommand as C;
         let paths: Vec<PathBuf> = if back {
-            self.history.back_list().take(12).map(std::path::Path::to_path_buf).collect()
+            self.history
+                .back_list()
+                .take(12)
+                .map(std::path::Path::to_path_buf)
+                .collect()
         } else {
             self.history
                 .forward_list()
@@ -1854,9 +1935,10 @@ impl Explorer {
             entries.push(placeholder(t!("path.no_history")));
         }
         for (ix, path) in paths.iter().enumerate() {
-            let label = path
-                .file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let label = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
             entries.push(item(
                 label,
                 None,
@@ -2717,16 +2799,11 @@ impl Explorer {
                             }))
                     })
                     .when(!enabled, |d| d.text_color(theme::text_disabled()))
-                    .children(item.glyph.map(|glyph| {
-                        svg()
-                            .path(glyph.path())
-                            .size(theme::ICON)
-                            .text_color(if enabled {
-                                theme::text()
-                            } else {
-                                theme::text_disabled()
-                            })
-                    }))
+                    .children(
+                        item.glyph.map(|glyph| {
+                            menu_glyph(glyph, tone_for(command), enabled, theme::ICON)
+                        }),
+                    )
                     .child(item.label.clone())
             }))
             .into_any_element()
@@ -2763,11 +2840,7 @@ impl Explorer {
             } else {
                 t!("menu.pin_command")
             }))
-            .child(svg().path(Icon::Pin.path()).size(theme::ICON_SM).text_color(if on {
-                theme::signal()
-            } else {
-                theme::text_muted()
-            }))
+            .child(menu_glyph(Icon::Pin, Tone::Main, true, theme::ICON_SM))
             // Handled here so the row doesn't run its command or close the menu.
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2780,6 +2853,7 @@ impl Explorer {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "a row needs its menu, position, entry and highlight state"
     )]
     fn render_menu_row(
@@ -2807,6 +2881,7 @@ impl Explorer {
             command,
             glyph,
             pin,
+            tone,
         }) = RowParts::of(entry)
         else {
             return div()
@@ -2818,7 +2893,7 @@ impl Explorer {
         };
         let key = level * LEVEL_STRIDE + ix;
         let geometry = Rc::clone(&menu.geometry);
-        let mark = marks.then(|| row_mark(icon, glyph, checked));
+        let mark = marks.then(|| row_mark(icon, glyph, checked, tone, enabled));
         let group: SharedString = format!("menu-row-{key}").into();
         let pin_button = pin.map(|pin| Self::pin_button(key, pin, pinned, group.clone(), cx));
         div()
@@ -2917,6 +2992,7 @@ struct RowParts {
     glyph: Option<Icon>,
     /// Windows menu items: pin key (row shows a pin on the right).
     pin: Option<String>,
+    tone: Tone,
 }
 
 impl RowParts {
@@ -2935,6 +3011,7 @@ impl RowParts {
                 command: Some(it.command),
                 glyph: it.glyph,
                 pin: it.pin.clone(),
+                tone: tone_for(it.command),
             }),
             MenuEntry::Submenu {
                 label,
@@ -2953,6 +3030,7 @@ impl RowParts {
                 command: None,
                 glyph: None,
                 pin: None,
+                tone: Tone::Main,
             }),
         }
     }
@@ -2960,7 +3038,13 @@ impl RowParts {
 
 /// Icon or check mark on the left of a row. If any row in a level has one, the whole level reserves
 /// the space.
-fn row_mark(icon: Option<Arc<RenderImage>>, glyph: Option<Icon>, checked: bool) -> gpui::Div {
+fn row_mark(
+    icon: Option<Arc<RenderImage>>,
+    glyph: Option<Icon>,
+    checked: bool,
+    tone: Tone,
+    enabled: bool,
+) -> gpui::Div {
     div()
         .size(theme::ICON)
         .flex_none()
@@ -2968,12 +3052,11 @@ fn row_mark(icon: Option<Arc<RenderImage>>, glyph: Option<Icon>, checked: bool) 
         .items_center()
         .justify_center()
         .children(icon.map(|image| img(image).size(theme::ICON)))
-        .children(glyph.filter(|_| !checked).map(|glyph| {
-            svg()
-                .path(glyph.path())
-                .size(theme::ICON)
-                .text_color(theme::text_muted())
-        }))
+        .children(
+            glyph
+                .filter(|_| !checked)
+                .map(|glyph| menu_glyph(glyph, tone, enabled, theme::ICON)),
+        )
         .when(checked, |d| {
             d.child(
                 svg()
@@ -3043,11 +3126,9 @@ const fn pref_key(entry: &MenuEntry) -> Option<&'static str> {
             C::Properties => Some("properties"),
             C::SetBackground => Some("set_background"),
             C::ImportSettings => Some("import_settings"),
-            C::ViewDetails
-            | C::ViewIcons
-            | C::ViewColumns
-            | C::SortBy(_)
-            | C::SortDirection(_) => Some("view"),
+            C::ViewDetails | C::ViewIcons | C::ViewColumns | C::SortBy(_) | C::SortDirection(_) => {
+                Some("view")
+            }
             C::KeepOnDevice | C::FreeUpSpace => Some("cloud"),
             C::AddToShelf => Some("shelf"),
             _ => None,

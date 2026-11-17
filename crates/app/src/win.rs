@@ -374,6 +374,30 @@ pub(crate) fn animations_enabled() -> bool {
     asked.is_err() || on.as_bool()
 }
 
+/// Lines one mouse-wheel notch scrolls (Settings > Bluetooth & devices > Mouse), 3 by default.
+/// gpui reports a notch as that many lines; Ctrl+wheel zoom divides by it so one notch is one
+/// step, as in File Explorer. `u32::MAX` means "one page per notch" and still divides back to one.
+pub(crate) fn wheel_scroll_lines() -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    // Simulated wheel events in tests are one line per notch.
+    if cfg!(test) {
+        return 1;
+    }
+    let mut lines = 3u32;
+    // SAFETY: lines is a correctly sized out param.
+    let asked = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if asked.is_err() || lines == 0 { 3 } else { lines }
+}
+
 /// Windows accent color as 0xRRGGBB. Asks DWM only (no registry); cheap enough for the UI thread.
 pub(crate) fn system_accent() -> Option<u32> {
     use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
@@ -2087,4 +2111,14 @@ pub(crate) fn read_reg_string(
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Some(String::from_utf16_lossy(&buf[..len])).filter(|s| !s.is_empty())
+}
+
+/// How long a click on the only selected item waits before renaming it: the system double-click
+/// time, as File Explorer's list view does (`GetDoubleClickTime`, 500 ms by default), so the
+/// first click of a double-click never renames. See `arke_core::slow_click`.
+pub(crate) fn rename_click_delay() -> std::time::Duration {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    // SAFETY: no arguments; reads a system setting.
+    let ms = unsafe { GetDoubleClickTime() };
+    arke_core::slow_click::delay_for(Some(ms))
 }

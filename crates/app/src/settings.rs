@@ -378,6 +378,40 @@ pub(crate) enum Density {
     Comfortable,
 }
 
+/// Item size in the Details view, below the Icons view's sizes on the Ctrl+wheel ladder. Small and
+/// medium keep the type icons (folders a little larger than file icons, as in Explorer); large
+/// rows show real thumbnails, easing into small icons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DetailsSize {
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+impl DetailsSize {
+    pub(crate) const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+
+    /// One step larger, if any.
+    pub(crate) const fn larger(self) -> Option<Self> {
+        match self {
+            Self::Small => Some(Self::Medium),
+            Self::Medium => Some(Self::Large),
+            Self::Large => None,
+        }
+    }
+
+    /// One step smaller, if any.
+    pub(crate) const fn smaller(self) -> Option<Self> {
+        match self {
+            Self::Small => None,
+            Self::Medium => Some(Self::Small),
+            Self::Large => Some(Self::Medium),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[allow(
@@ -396,6 +430,8 @@ pub(crate) struct Settings {
     pub(crate) recent: Vec<PathBuf>,
     pub(crate) tab_layout: TabLayout,
     pub(crate) density: Density,
+    /// Item size in the Details view (Ctrl+wheel below small icons).
+    pub(crate) details_size: DetailsSize,
     /// Preview pane on the right.
     pub(crate) preview_pane: bool,
     /// Ctrl+T searches the whole PC. Needs an index, off by default.
@@ -574,6 +610,7 @@ impl Default for Settings {
             recent: Vec::new(),
             tab_layout: TabLayout::default(),
             density: Density::default(),
+            details_size: DetailsSize::default(),
             preview_pane: false,
             global_search: false,
             search_network: Vec::new(),

@@ -226,9 +226,16 @@ impl Workspace {
             .a11y(gpui::Role::Link, t!("home.title"))
             .relative()
             .flex_none()
-            .h(theme::H_ROW)
+            // Same height as the back / forward / refresh buttons and the path bar.
+            .h(theme::H_TOP)
             .mx(theme::S_8)
-            .mb(theme::S_4)
+            // Horizontal tabs: Home sits beside the toolbar row (H_BAR tall, controls centered),
+            // so it takes the same top and bottom space to line up with the path bar.
+            .when(Self::horizontal_tabs(cx), |d| {
+                d.mt((theme::H_BAR - theme::H_TOP) / 2.)
+                    .mb((theme::H_BAR - theme::H_TOP) / 2.)
+            })
+            .when(!Self::horizontal_tabs(cx), |d| d.mb(theme::S_4))
             .pl(theme::S_8)
             .flex()
             .items_center()

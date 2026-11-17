@@ -147,6 +147,11 @@ icons![
     FileExt => "file-ext",
     Image => "image",
     Sort => "sort",
+    // Two-tone menu icons, one layer each, stacked in one cell (see `explorer_menu::menu_glyph`)
+    SortUp => "sort-up",
+    SortDown => "sort-down",
+    FolderPlusBody => "folder-plus-body",
+    FolderPlusMark => "folder-plus-mark",
     Globe => "globe",
     Power => "power",
     Info => "info",

@@ -27,6 +27,17 @@ static SYSTEM_TYPE_ICONS: AtomicBool = AtomicBool::new(true);
 static SHELL_THUMBNAILS: AtomicBool = AtomicBool::new(true);
 /// Typing in the search box searches subfolders.
 static SEARCH_SUBFOLDERS: AtomicBool = AtomicBool::new(true);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SEARCH_SUBFOLDERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Settings → Search's subfolder option for the calling test's thread only.
+#[cfg(test)]
+pub(crate) fn set_search_subfolders_for_test(on: bool) {
+    TEST_SEARCH_SUBFOLDERS.with(|c| c.set(on));
+}
 /// Icons view tile width in percent of the icon size.
 static TILE_RATIO: AtomicU32 = AtomicU32::new(DEFAULT_TILE_RATIO);
 /// Context bar size in percent.
@@ -404,7 +415,13 @@ pub(crate) fn shell_thumbnails() -> bool {
 
 /// Whether typing in the search box searches subfolders (else it filters the current folder).
 pub(crate) fn search_subfolders() -> bool {
-    SEARCH_SUBFOLDERS.load(Ordering::Relaxed)
+    // Tests run in parallel in one process and keep upstream's "this folder" typing default per
+    // thread, so a test that creates a workspace (which applies the settings) can't flip another.
+    #[cfg(test)]
+    let on = TEST_SEARCH_SUBFOLDERS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let on = SEARCH_SUBFOLDERS.load(Ordering::Relaxed);
+    on
 }
 
 /// Icons view tile width per pixel of icon size (1.3 by default).

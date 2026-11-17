@@ -1838,7 +1838,11 @@ impl Workspace {
                     .gap(theme::S_6)
                     .rounded(theme::R_4)
                     .when(active_pane == Some(pane), |d| d.bg(theme::signal_wash()))
-                    .child(crate::assets::sidebar_icon(Icon::Folder, SB_ICON, theme::text_muted()))
+                    .child(crate::assets::sidebar_icon(
+                        Icon::Folder,
+                        SB_ICON,
+                        theme::text_muted(),
+                    ))
                     .child(div().min_w_0().truncate().child(title))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         cx.stop_propagation();
@@ -2014,9 +2018,7 @@ impl Workspace {
             let title = titles.into_iter().next().unwrap_or_default();
             // Home, Settings and Recycle Bin use their own page icon.
             let icon = match self.page_title(tab.view().entity_id()) {
-                Some((_, icon)) => {
-                    crate::assets::sidebar_icon(icon, SB_ICON, theme::text_muted())
-                }
+                Some((_, icon)) => crate::assets::sidebar_icon(icon, SB_ICON, theme::text_muted()),
                 None => crate::assets::sidebar_icon(Icon::Folder, SB_ICON, theme::text_muted()),
             };
             row.gap(theme::S_8)

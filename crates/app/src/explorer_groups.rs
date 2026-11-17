@@ -46,7 +46,10 @@ pub(crate) struct Groups {
 
 /// Cached layouts, queried on every render.
 #[derive(Default)]
-pub(crate) struct GroupCache(RefCell<Option<Rc<Groups>>>, RefCell<Option<Rc<GridSections>>>);
+pub(crate) struct GroupCache(
+    RefCell<Option<Rc<Groups>>>,
+    RefCell<Option<Rc<GridSections>>>,
+);
 
 /// Grid sections: (label, first item, count), with what they were built from.
 pub(crate) type GridSections = (GridKey, Vec<(SharedString, usize, usize)>);
@@ -261,13 +264,7 @@ impl Explorer {
             folders_apart,
             today.day,
         );
-        if let Some(cached) = self
-            .group_cache
-            .1
-            .borrow()
-            .as_ref()
-            .filter(|g| g.0 == key)
-        {
+        if let Some(cached) = self.group_cache.1.borrow().as_ref().filter(|g| g.0 == key) {
             return Some(Rc::clone(cached));
         }
         let (rows, _) = build(&view, self.sort.column, folders_apart, today);

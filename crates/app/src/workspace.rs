@@ -888,7 +888,7 @@ impl Workspace {
     }
 
     /// Tabs are on top (setting).
-    fn horizontal_tabs(cx: &App) -> bool {
+    pub(crate) fn horizontal_tabs(cx: &App) -> bool {
         cx.try_global::<crate::settings::GlobalSettings>()
             .is_some_and(|g| g.0.read(cx).settings.tab_layout == TabLayout::Horizontal)
     }
@@ -2348,7 +2348,9 @@ impl Workspace {
                 let view = view.clone();
                 move |e: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
                     cx.stop_propagation();
-                    view.update(cx, |v, cx| v.open_history_menu(back, e.position, window, cx));
+                    view.update(cx, |v, cx| {
+                        v.open_history_menu(back, e.position, window, cx);
+                    });
                 }
             }
         };
@@ -2467,7 +2469,7 @@ impl Workspace {
                     .id("strip-new-tab")
                     .a11y_button(t!("sidebar.new_tab"))
                     .aria_keyshortcuts("Ctrl+T")
-                    .size(theme::H_CTL)
+                    .size(theme::H_TOP)
                     .flex()
                     .flex_none()
                     .items_center()

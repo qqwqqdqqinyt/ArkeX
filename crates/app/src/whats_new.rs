@@ -6,7 +6,8 @@
 //! the changelogs yet.
 //!
 //! The first time a stable or RC build runs after an update, the page opens once
-//! (`Settings::whats_new_seen` remembers the version). Not on a first install, not for nightly
+//! (`Settings::whats_new_seen` remembers the version). Not for a patch update (same major.minor),
+//! not on a first install, not for nightly
 //! builds (they come daily) or dev builds, and not when Settings › About turns it off. The page
 //! is in `workspace_whats_new.rs`.
 
@@ -150,7 +151,13 @@ pub(crate) fn on_startup(
         .and_then(key)
         .zip(key(current))
         .is_some_and(|(seen, now)| now < seen);
-    if first_run || downgrade || channel == Channel::Nightly || !auto {
+    // A patch release (same major.minor as the version last seen) records itself quietly: its
+    // notes stay in Settings › About, but the page doesn't open for small updates.
+    let patch_only = seen
+        .and_then(key)
+        .zip(key(current))
+        .is_some_and(|((seen, _), (now, _))| (seen.0, seen.1) == (now.0, now.1));
+    if first_run || downgrade || patch_only || channel == Channel::Nightly || !auto {
         Startup::Record
     } else {
         Startup::Show
@@ -254,6 +261,16 @@ mod tests {
             on_startup(Some("0.2.0"), false, "0.3.0", None, true),
             Nothing,
             "dev build"
+        );
+        assert_eq!(
+            on_startup(Some("0.3.0"), false, "0.3.1", stable, true),
+            Record,
+            "patch update"
+        );
+        assert_eq!(
+            on_startup(Some("0.3.4"), false, "0.4.0", stable, true),
+            Show,
+            "minor update"
         );
     }
 

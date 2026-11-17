@@ -46,7 +46,8 @@ use gpui::{
 };
 use rust_i18n::t;
 
-use super::{AppEvent, Explorer, kind_icon, spawn_thread};
+use super::view::entry_visual;
+use super::{AppEvent, DetailsMetrics, Explorer, kind_icon, spawn_thread};
 use office::{SlidesView, WorkbookView, load_office};
 
 #[path = "explorer_office.rs"]
@@ -68,8 +69,10 @@ const LOADING_GRACE: Duration = Duration::from_millis(250);
 const SKELETON_PULSE: Duration = Duration::from_millis(1200);
 /// Long side of image previews
 const IMAGE_SIDE: u32 = 1600;
-/// Box the folder ring's front picture fills (its thumbnails are decoded for it)
-const DIR_RING_PICTURE: f32 = 178.;
+/// At most this many rows of the folder preview's list ask for thumbnails.
+const FOLDER_THUMBS: usize = 300;
+/// Indent per level of a subfolder expanded in the folder preview's list.
+const FOLDER_INDENT: Pixels = theme::S_16;
 /// Padding around the side preview's contents (Atlas-style fuller pane: 8, was 12).
 const PANE_PAD: Pixels = theme::S_8;
 /// Bytes read for text previews
@@ -523,12 +526,6 @@ impl Explorer {
     /// would contradict the status line. Quick Look follows the cursor regardless, since Space on
     /// the cursor item asks for it explicitly.
     fn preview_target(&self) -> Option<(PathBuf, Entry)> {
-        // A picture opened from the folder preview's list, until Quick Look is gone.
-        if (self.quick_look || self.closing_quick_look.is_some())
-            && let Some(target) = &self.look_override
-        {
-            return Some(target.clone());
-        }
         if self.search_mode {
             // Search results are single-select: the cursor is the selection.
             let hit = self.search_hit(Some(self.current_cursor()?))?;
@@ -556,7 +553,7 @@ impl Explorer {
         reason = "One pass over what can happen on a frame (same PDF resized, cache hit, cloud, load); split up, the order of the checks would be harder to follow"
     )]
     pub(super) fn sync_preview(&mut self, cx: &mut Context<Self>) {
-        self.sync_dir_ring(cx);
+        self.sync_folder_preview(cx);
         if !(self.quick_look || self.preview_shown() || self.hosts_shared_preview()) {
             return;
         }
@@ -802,7 +799,6 @@ impl Explorer {
     /// preview pane shows it.
     fn after_quick_look(&mut self, cx: &mut Context<Self>) {
         self.reset_zoom(cx);
-        self.look_override = None;
         if !self.preview_pane {
             self.set_preview(None, cx);
         }
@@ -1304,9 +1300,7 @@ impl Explorer {
                 .map(theme::preview_sheet)
                 .child(super::markdown_view::markdown(text, false))
                 .into_any_element(),
-            PreviewBody::Folder { entries, total } => {
-                Self::folder_list(&preview.path, entries, *total, scroll, None, None)
-            }
+            PreviewBody::Folder { entries, total } => Self::folder_list(entries, *total, scroll),
             PreviewBody::Document(doc) => office::document_body(doc, false, scroll),
             PreviewBody::Workbook(view) => office::sheet_grid(view, false, scroll),
             PreviewBody::Slides(view) => office::slides_pane(view),
@@ -1351,19 +1345,11 @@ impl Explorer {
         }
     }
 
-    /// Folder contents. With `cx` the entries are clickable: enter that folder and select the
-    /// clicked item.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one row builder with its click, double click and right click handlers"
-    )]
+    /// Folder contents as a plain list (Quick Look; the side pane uses [`Self::pane_folder_list`]).
     fn folder_list(
-        dir: &Path,
         entries: &Arc<Vec<Entry>>,
         total: usize,
         scroll: &gpui::ScrollHandle,
-        picked: Option<&Arc<str>>,
-        mut cx: Option<&mut Context<Self>>,
     ) -> AnyElement {
         if entries.is_empty() {
             return div()
@@ -1380,7 +1366,7 @@ impl Explorer {
             .iter()
             .enumerate()
             .map(|(ix, entry)| {
-                let row = div()
+                div()
                     .id(("preview-row", ix))
                     .h(theme::S_24 + theme::S_4)
                     .px(theme::S_8)
@@ -1390,7 +1376,6 @@ impl Explorer {
                     .gap(theme::S_8)
                     .rounded(theme::R_8)
                     .when(entry.is_hidden(), |d| d.text_color(theme::text_subtle()))
-                    .when(picked == Some(&entry.name), |d| d.bg(theme::selection()))
                     .child(kind_icon(file_kind(entry), theme::ICON))
                     .child(
                         div()
@@ -1398,64 +1383,8 @@ impl Explorer {
                             .min_w_0()
                             .truncate()
                             .child(SharedString::from(Arc::clone(&entry.name))),
-                    );
-                match cx.as_deref_mut() {
-                    Some(cx) => {
-                        let dir = dir.to_path_buf();
-                        let name = Arc::clone(&entry.name);
-                        let (item, is_dir) = (dir.join(&*name), entry.is_dir_like());
-                        // Pictures Arke decodes itself open in Quick Look (as Space does).
-                        let look = (entry.kind == arke_core::EntryKind::File
-                            && !entry.is_cloud_placeholder()
-                            && arke_core::filetype::decodes_in_rust(entry.extension()))
-                        .then(|| (item.clone(), entry.clone()));
-                        // Click: a picture Arke decodes opens in Quick Look; anything else is
-                        // picked and, once it has a picture, shown large above the list (again:
-                        // back to the ring). Double click: enter the folder with it selected.
-                        // Right click: its menu.
-                        row.cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    this.open_item_menu_at(
-                                        item.clone(),
-                                        is_dir,
-                                        e.position,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .hover(|s| s.bg(theme::wash()))
-                            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
-                                if e.click_count() >= 2 {
-                                    this.preview_pick = None;
-                                    this.navigate_selecting(
-                                        dir.clone(),
-                                        arke_core::NavKind::New,
-                                        Some(Arc::clone(&name)),
-                                        cx,
-                                    );
-                                    return;
-                                }
-                                if let Some(target) = look.clone() {
-                                    this.look_at(target, cx);
-                                    return;
-                                }
-                                let pick = (dir.clone(), Arc::clone(&name));
-                                if this.preview_pick.as_ref() == Some(&pick) {
-                                    this.preview_pick = None;
-                                } else {
-                                    this.preview_pick = Some(pick);
-                                    this.pick_image = None;
-                                }
-                                cx.notify();
-                            }))
-                            .into_any_element()
-                    }
-                    None => row.into_any_element(),
-                }
+                    )
+                    .into_any_element()
             })
             .collect();
         let more = total.saturating_sub(entries.len());
@@ -1701,75 +1630,236 @@ impl Explorer {
         cx.notify();
     }
 
-    /// A click on one of the ring's pictures: Quick Look for a picture Arke decodes, otherwise
-    /// open it.
-    pub(crate) fn ring_click(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let entry = match self.preview.as_ref().map(|p| &p.body) {
-            Some(PreviewBody::Folder { entries, .. }) => path
-                .file_name()
-                .and_then(|n| entries.iter().find(|e| *e.name == *n.to_string_lossy()))
-                .cloned(),
+    /// A subfolder in the folder preview's list: expand it in place (its items listed below it,
+    /// indented), or collapse it and everything opened inside it.
+    pub(crate) fn toggle_preview_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.preview_open.remove(&path).is_some() {
+            self.preview_open.retain(|p, _| !p.starts_with(&path));
+            if self
+                .preview_pick
+                .as_ref()
+                .is_some_and(|(dir, _)| dir.starts_with(&path))
+            {
+                self.preview_pick = None;
+            }
+            cx.notify();
+            return;
+        }
+        self.preview_open.insert(path.clone(), None);
+        cx.notify();
+        let fs = Arc::clone(&self.services.fs);
+        let (show_hidden, sort) = (self.show_hidden, self.sort);
+        let (tx, rx) = flume::bounded(1);
+        let dir = path.clone();
+        spawn_thread("preview-subfolder", move || {
+            let _ = tx.send(load_folder(fs.as_ref(), &dir, show_hidden, sort));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(data) = rx.recv_async().await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                // Collapsed (or another folder previewed) meanwhile: nothing to fill.
+                if let Some(slot) = this.preview_open.get_mut(&path) {
+                    *slot = Some(match data {
+                        PreviewData::Folder { entries, total } => (Arc::new(entries), total),
+                        _ => (Arc::default(), 0),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The folder preview's list as drawn: the folder's items, each expanded subfolder's items
+    /// right after it, one level deeper.
+    fn folder_rows(&self, root: &Path, entries: &[Entry]) -> Vec<FolderRow> {
+        fn walk(
+            this: &Explorer,
+            dir: &Path,
+            entries: &[Entry],
+            depth: u16,
+            out: &mut Vec<FolderRow>,
+        ) {
+            for entry in entries {
+                let path = dir.join(&*entry.name);
+                let open = entry.is_dir_like().then(|| this.preview_open.get(&path));
+                out.push(FolderRow {
+                    depth,
+                    dir: dir.to_path_buf(),
+                    entry: entry.clone(),
+                    expanded: open.is_some_and(|o| o.is_some()),
+                    loading: open.is_some_and(|o| matches!(o, Some(None))),
+                });
+                if let Some(Some(Some((children, _)))) = open
+                    && depth < 32
+                {
+                    walk(this, &path, children, depth + 1, out);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        walk(self, root, entries, 0, &mut rows);
+        rows
+    }
+
+    /// Runs every render: thumbnails for the folder preview's rows, the picked file's large
+    /// picture and the folder's cover, all through the media cache after what the lists want.
+    fn sync_folder_preview(&mut self, cx: &mut Context<Self>) {
+        let folder = match self.preview.as_ref() {
+            Some(Preview {
+                path,
+                body: PreviewBody::Folder { entries, .. },
+                ..
+            }) => Some((path.clone(), Arc::clone(entries))),
             _ => None,
         };
-        match entry {
-            Some(entry)
-                if entry.kind == arke_core::EntryKind::File
-                    && arke_core::filetype::decodes_in_rust(entry.extension()) =>
-            {
-                self.look_at((path, entry), cx);
-            }
-            _ => self.open_preview_item(path, cx),
+        let here = folder.as_ref().map(|(path, _)| path.clone());
+        // Expanded subfolders and a pick belong to the folder they were made in.
+        if self.preview_open_root != here {
+            self.preview_open.clear();
+            self.preview_open_root.clone_from(&here);
         }
-    }
-
-    /// Quick Look on `target`, an item of the folder preview's list (not the list's cursor).
-    fn look_at(&mut self, target: (PathBuf, Entry), cx: &mut Context<Self>) {
-        self.preview_pick = None;
-        self.pick_image = None;
-        self.look_override = Some(target);
-        if !self.quick_look {
-            self.toggle_quick_look(cx);
-        }
-        cx.notify();
-    }
-
-    /// The folder preview's picked item, filling the pane's width where the ring turns, once it
-    /// has a picture (items with none, or still loading, keep the ring: only what can be previewed
-    /// is shown large). Clicking it goes back to the ring.
-    fn picked_view(&self, entries: &[Entry], cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (dir, name) = self.preview_pick.as_ref()?;
-        let image = self.pick_image.as_ref()?;
-        let entry = entries.iter().find(|e| e.name == *name)?;
-        let (path, is_dir) = (dir.join(&*entry.name), entry.is_dir_like());
-        let width = self.pane_frame_w();
-        let height = self
-            .dir_ring
+        if self
+            .preview_pick
             .as_ref()
-            .map_or(width, |ring| px(ring.read(cx).height()))
-            .max(width * 0.75);
-        let body = gpui::img(Arc::clone(image))
-            .size_full()
-            .object_fit(gpui::ObjectFit::Contain)
-            .into_any_element();
+            .is_some_and(|(dir, _)| here.as_ref().is_none_or(|h| !dir.starts_with(h)))
+        {
+            self.preview_pick = None;
+        }
+        let Some((root, entries)) = folder.filter(|(path, _)| {
+            self.preview_shown() && !self.quick_look && self.media_ok(path, cx)
+        }) else {
+            self.pick_image = None;
+            self.preview_cover = None;
+            self.preview_thumbs.clear();
+            return;
+        };
+        let rows = self.folder_rows(&root, &entries);
+        let stage_px =
+            arke_core::thumbs::source_size(f32::from(self.pane_frame_w()), self.ui_scale);
+        let picture = |path: PathBuf, entry: &Entry, px: u32| {
+            MediaKey::at(path, entry, Some(px)).filter(|k| k.kind != MediaKind::SystemIcon)
+        };
+        let pick_key = self.preview_pick.as_ref().and_then(|(dir, name)| {
+            rows.iter()
+                .find(|r| r.dir == *dir && r.entry.name == *name)
+                .and_then(|r| picture(dir.join(&**name), &r.entry, stage_px))
+        });
+        // The cover: the first of the folder's own files that has a picture.
+        let cover_keys: Vec<MediaKey> = entries
+            .iter()
+            .filter(|e| e.kind == arke_core::EntryKind::File && !e.is_hidden())
+            .filter_map(|e| picture(root.join(&*e.name), e, stage_px))
+            .take(3)
+            .collect();
+        let large = DetailsMetrics::of(crate::settings::DetailsSize::Large);
+        let row_px = arke_core::thumbs::source_size(
+            f32::from(large.thumbnail.unwrap_or(large.icon)),
+            self.ui_scale,
+        );
+        let shown = rows.len().min(FOLDER_THUMBS);
+        let row_keys: Vec<Option<MediaKey>> = rows[..shown]
+            .iter()
+            .map(|r| MediaKey::at(r.dir.join(&*r.entry.name), &r.entry, Some(row_px)))
+            .collect();
+        let wanted = pick_key
+            .iter()
+            .cloned()
+            .chain(cover_keys.iter().cloned())
+            .chain(row_keys.iter().flatten().cloned())
+            .collect();
+        self.media.update(cx, |m, _| m.want_aux(wanted));
+        let images: Vec<Option<Arc<gpui::RenderImage>>> = {
+            let media = self.media.read(cx);
+            self.pick_image = pick_key.as_ref().and_then(|k| media.get_or_nearby(k));
+            self.preview_cover = cover_keys
+                .iter()
+                .find_map(|k| media.get_or_nearby(k).map(|img| (k.path.clone(), img)));
+            row_keys
+                .iter()
+                .map(|k| k.as_ref().and_then(|k| media.get_or_nearby(k)))
+                .collect()
+        };
+        let row_entries: Vec<Entry> = rows[..shown].iter().map(|r| r.entry.clone()).collect();
+        let images = self.with_type_icons(&row_entries, 0..shown, images, true, cx);
+        self.preview_thumbs = rows[..shown]
+            .iter()
+            .zip(images)
+            .filter_map(|(r, img)| img.map(|img| (r.dir.join(&*r.entry.name), img)))
+            .collect();
+    }
+
+    /// Above the folder preview's list: the picked file previewed large, or the folder's first
+    /// picture until one is picked. Double click opens it; right click shows its menu.
+    #[expect(clippy::single_match_else, reason = "both arms build the stage body")]
+    fn folder_stage(&self, rows: &[FolderRow], cx: &mut Context<Self>) -> Option<AnyElement> {
+        let width = self.pane_frame_w();
+        let (path, body) = match self.preview_pick.as_ref() {
+            Some((dir, name)) => {
+                let row = rows
+                    .iter()
+                    .find(|r| r.dir == *dir && r.entry.name == *name)?;
+                let body = match &self.pick_image {
+                    Some(image) => gpui::img(Arc::clone(image))
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element(),
+                    // No picture (yet): its icon, large, with the name under it.
+                    None => div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(theme::S_8)
+                        .px(theme::S_12)
+                        .child(entry_visual(
+                            &row.entry,
+                            self.preview_thumbs.get(&dir.join(&**name)).cloned(),
+                            px(72.),
+                            px(72.),
+                        ))
+                        .child(
+                            div()
+                                .max_w_full()
+                                .truncate()
+                                .text_size(theme::FS_12)
+                                .text_color(theme::text_muted())
+                                .child(SharedString::from(Arc::clone(name))),
+                        )
+                        .into_any_element(),
+                };
+                (dir.join(&**name), body)
+            }
+            None => {
+                let (path, image) = self.preview_cover.as_ref()?;
+                (
+                    path.clone(),
+                    gpui::img(Arc::clone(image))
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element(),
+                )
+            }
+        };
+        let is_dir = false;
         Some(
             div()
-                .id("preview-pick")
+                .id("preview-stage")
                 .flex_none()
                 .w(width)
-                .h(height)
+                .h(width * 0.75)
                 .rounded(theme::R_8)
                 .overflow_hidden()
-                .cursor_pointer()
-                // Click: back to the ring. Double click: open it. Right click: its menu.
+                .bg(theme::wash())
                 .on_click(cx.listener({
                     let path = path.clone();
                     move |this, e: &ClickEvent, _, cx| {
                         if e.click_count() >= 2 {
                             this.open_preview_item(path.clone(), cx);
-                            return;
                         }
-                        this.preview_pick = None;
-                        cx.notify();
                     }
                 }))
                 .on_mouse_down(
@@ -1784,83 +1874,197 @@ impl Explorer {
         )
     }
 
-    /// Atlas's folder preview: the previewed folder's first pictures (thumbnails it can get) ride
-    /// a ring above its listing in the side pane. Runs every render; loads go through the media
-    /// cache after everything the lists want.
-    fn sync_dir_ring(&mut self, cx: &mut Context<Self>) {
-        // A pick belongs to the folder it was made in.
-        let here = self.preview.as_ref().map(|p| p.path.as_path());
-        if self.preview_pick.as_ref().is_some_and(|(dir, _)| Some(dir.as_path()) != here) {
-            self.preview_pick = None;
+    /// The folder preview's list in the side pane, as the Details view's large size: thumbnails,
+    /// the name over its date and size. Click a file: preview it above the list (again: back to
+    /// the cover). Click a folder: expand it in place. Double click: enter a folder, or open a
+    /// file's folder with it selected. Right click: its menu.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one row builder with its click, double click and right click handlers"
+    )]
+    fn pane_folder_list(
+        &self,
+        rows: Vec<FolderRow>,
+        total: usize,
+        scroll: &gpui::ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if rows.is_empty() {
+            return Self::folder_list(&Arc::default(), 0, scroll);
         }
-        // The picked item, decoded to fill the pane's width.
-        let pick_key = match (self.preview.as_ref(), self.preview_pick.as_ref()) {
-            (
-                Some(Preview {
-                    path,
-                    body: PreviewBody::Folder { entries, .. },
-                    ..
-                }),
-                Some((_, name)),
-            ) if self.media_ok(path, cx) => {
-                let px = arke_core::thumbs::source_size(
-                    f32::from(self.pane_frame_w()),
-                    self.ui_scale,
-                );
-                entries
-                    .iter()
-                    .find(|e| e.name == *name)
-                    .and_then(|e| MediaKey::at(path.join(&*e.name), e, Some(px)))
-                    .filter(|k| k.kind != MediaKind::SystemIcon)
-            }
-            _ => None,
-        };
-        let keys: Vec<MediaKey> = match self.preview.as_ref() {
-            Some(Preview {
-                path,
-                body: PreviewBody::Folder { entries, .. },
-                ..
-            }) if self.preview_shown() && !self.quick_look && self.media_ok(path, cx) => {
-                // The ring scales with the pane's width (`DirRing::set_width`); so do its pictures.
-                let zoom = (f32::from(self.pane_frame_w()) / 236.).clamp(0.8, 2.2);
-                let px = arke_core::thumbs::source_size(DIR_RING_PICTURE * zoom, self.ui_scale);
-                entries
-                    .iter()
-                    .filter(|e| !e.is_hidden())
-                    .filter_map(|e| MediaKey::at(path.join(&*e.name), e, Some(px)))
-                    .filter(|k| k.kind != MediaKind::SystemIcon)
-                    .take(crate::dir_ring::RING_LIMIT)
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
-        let wanted = pick_key.iter().cloned().chain(keys.iter().cloned()).collect();
-        self.media.update(cx, |m, _| m.want_aux(wanted));
-        let items: Vec<(PathBuf, Arc<gpui::RenderImage>)> = {
-            let media = self.media.read(cx);
-            self.pick_image = pick_key.as_ref().and_then(|k| media.get_or_nearby(k));
-            keys.iter()
-                .filter_map(|k| media.get_or_nearby(k).map(|img| (k.path.clone(), img)))
-                .collect()
-        };
-        self.dir_ring_shown = !items.is_empty();
-        if !self.dir_ring_shown && self.dir_ring.is_none() {
-            return;
-        }
-        let folder = self
-            .preview
-            .as_ref()
-            .map_or_else(PathBuf::default, |p| p.path.clone());
-        let width = f32::from(self.pane_frame_w());
-        let owner = cx.entity().downgrade();
-        let ring = crate::dir_ring::ensure(&mut self.dir_ring, cx);
-        ring.update(cx, |ring, cx| {
-            // Both run: the ring fills the pane's width, then takes the folder's pictures.
-            let resized = ring.set_width(width);
-            if ring.set_items(&folder, owner, items) || resized {
-                cx.notify();
-            }
-        });
+        let large = DetailsMetrics::of(crate::settings::DetailsSize::Large);
+        let row_h = theme::H_ROW + large.extra_row;
+        let thumb = large.thumbnail.unwrap_or(large.icon);
+        let shell = Arc::clone(&self.services.shell);
+        let picked = self.preview_pick.clone();
+        let root_len = rows.iter().filter(|r| r.depth == 0).count();
+        let elements: Vec<AnyElement> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(ix, row)| {
+                let FolderRow {
+                    depth,
+                    dir,
+                    entry,
+                    expanded,
+                    loading,
+                } = row;
+                let name = Arc::clone(&entry.name);
+                let path = dir.join(&*name);
+                let is_dir = entry.is_dir_like();
+                let is_picked = picked
+                    .as_ref()
+                    .is_some_and(|(d, n)| *d == dir && *n == name);
+                let icon = if is_dir { large.folder } else { large.icon };
+                let image = self.preview_thumbs.get(&path).cloned();
+                let visual = entry_visual(&entry, image, thumb, icon);
+                let mut detail: Vec<String> = Vec::new();
+                if let Some(t) = entry.modified {
+                    detail.push(shell.format_time(t));
+                }
+                if !is_dir {
+                    detail.push(format_size(entry.size));
+                }
+                let chevron = div().size(theme::ICON_SM).flex_none().when(is_dir, |d| {
+                    d.child(
+                        gpui::svg()
+                            .path(crate::assets::Icon::ChevronRight.path())
+                            .size(theme::ICON_SM)
+                            .text_color(if loading {
+                                theme::text_disabled()
+                            } else {
+                                theme::text_subtle()
+                            })
+                            .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                                if expanded {
+                                    std::f32::consts::FRAC_PI_2
+                                } else {
+                                    0.
+                                },
+                            ))),
+                    )
+                });
+                div()
+                    .id(("preview-row", ix))
+                    .h(row_h)
+                    .pl(theme::S_4 + FOLDER_INDENT * f32::from(depth))
+                    .pr(theme::S_8)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(theme::S_6)
+                    .rounded(theme::R_8)
+                    .when(entry.is_hidden(), |d| d.text_color(theme::text_subtle()))
+                    .when(is_picked, |d| d.bg(theme::selection()))
+                    .child(chevron)
+                    .child(
+                        div()
+                            .w(thumb)
+                            .h(thumb)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(visual),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(theme::S_2)
+                            .child(
+                                div()
+                                    .truncate()
+                                    .child(SharedString::from(Arc::clone(&name))),
+                            )
+                            .when(!detail.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .truncate()
+                                        .text_size(theme::FS_12)
+                                        .text_color(theme::text_subtle())
+                                        .child(detail.join(" · ")),
+                                )
+                            }),
+                    )
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::wash()))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let path = path.clone();
+                            move |this, e: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_item_menu_at(
+                                    path.clone(),
+                                    is_dir,
+                                    e.position,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                        if e.click_count() >= 2 {
+                            this.preview_pick = None;
+                            // A folder: go into it. A file: go to its folder with it selected.
+                            if is_dir {
+                                this.navigate(path.clone(), arke_core::NavKind::New, cx);
+                                return;
+                            }
+                            this.navigate_selecting(
+                                dir.clone(),
+                                arke_core::NavKind::New,
+                                Some(Arc::clone(&name)),
+                                cx,
+                            );
+                            return;
+                        }
+                        if is_dir {
+                            this.toggle_preview_folder(path.clone(), cx);
+                            return;
+                        }
+                        let pick = (dir.clone(), Arc::clone(&name));
+                        if this.preview_pick.as_ref() == Some(&pick) {
+                            this.preview_pick = None;
+                        } else {
+                            this.preview_pick = Some(pick);
+                            this.pick_image = None;
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        let more = total.saturating_sub(root_len);
+        div()
+            .id("preview-folder")
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .track_scroll(scroll)
+            .children(elements)
+            .when(more > 0, |d| {
+                d.child(
+                    div()
+                        .px(theme::S_8)
+                        .py(theme::S_4)
+                        .text_size(theme::FS_12)
+                        .text_color(theme::text_subtle())
+                        .child(
+                            t!(
+                                "preview.more_items",
+                                count = arke_core::format::format_count(more)
+                            )
+                            .into_owned(),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     /// The side preview (pane or the column view's last column) is on and fits at this width.
@@ -2001,34 +2205,20 @@ impl Explorer {
                         .text_color(theme::text_subtle())
                         .child(tn!("info.items", *total).into_owned()),
                 )
-                .map(|pane| match self.picked_view(entries, cx) {
-                    // The single-clicked item, large, where the ring turns.
-                    Some(picked) => pane.child(picked),
-                    None => pane.when_some(
-                        self.dir_ring.clone().filter(|_| self.dir_ring_shown),
-                        |pane, ring| {
-                            pane.child(div().flex_none().flex().justify_center().child(ring))
-                        },
-                    ),
-                })
-                .child({
+                .map(|pane| {
+                    let rows = self.folder_rows(&preview.path, entries);
+                    let stage = self.folder_stage(&rows, cx);
                     let (scroll, drag) = (
                         self.preview_scroll.clone(),
                         Rc::clone(&self.preview_scrollbar),
                     );
-                    let picked = self.preview_pick.as_ref().map(|(_, name)| name);
-                    let list = Self::folder_list(
-                        &preview.path,
-                        entries,
-                        *total,
-                        &scroll,
-                        picked,
-                        Some(cx),
-                    );
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(Self::with_preview_scrollbar(list, &scroll, &drag))
+                    let list = self.pane_folder_list(rows, *total, &scroll, cx);
+                    pane.children(stage).child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(Self::with_preview_scrollbar(list, &scroll, &drag)),
+                    )
                 })
                 .into_any_element();
         }
@@ -2503,10 +2693,6 @@ impl Explorer {
     /// Quick Look's previous / next buttons: the item before or after the cursor, as ↑ and ↓ do
     /// in a list.
     fn look_step(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if self.look_override.is_some() {
-            // A picture from the folder preview isn't in the list; there's no neighbour to show.
-            return;
-        }
         let Some(cursor) = self.current_cursor() else {
             return;
         };
@@ -3709,4 +3895,15 @@ fn loading_skeleton(since: std::time::Instant) -> AnyElement {
         },
     )
     .into_any_element()
+}
+
+/// A row of the folder preview's list: an item of the folder or of a subfolder expanded in it.
+struct FolderRow {
+    depth: u16,
+    /// The folder the item is in.
+    dir: PathBuf,
+    entry: Entry,
+    /// A folder whose items are listed below it (`loading`: still being read).
+    expanded: bool,
+    loading: bool,
 }
