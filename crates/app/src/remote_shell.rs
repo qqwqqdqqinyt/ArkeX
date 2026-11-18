@@ -509,13 +509,14 @@ impl Shell for RemoteShell {
     fn disk_spaces(&self, roots: &[PathBuf]) -> Vec<(PathBuf, (u64, u64))> {
         self.inner.disk_spaces(roots)
     }
-    fn open(&self, path: &Path) -> Result<(), ShellError> {
+    fn open(&self, path: &Path, sort: Option<arke_core::SortSpec>) -> Result<(), ShellError> {
         match remote(path) {
+            // A downloaded copy has no folder to step through.
             Some(url) => {
                 let local = self.remotes.fetch(&url, OPEN_MAX)?;
-                self.inner.open(&local)
+                self.inner.open(&local, None)
             }
-            None => self.inner.open(path),
+            None => self.inner.open(path, sort),
         }
     }
     fn expand_env(&self, input: &str) -> String {
@@ -566,6 +567,9 @@ impl Shell for RemoteShell {
             return Ok(DragOutEnd::Finished);
         }
         self.inner.drag_out(paths, image)
+    }
+    fn covered_at_cursor(&self, owner: Option<isize>) -> bool {
+        self.inner.covered_at_cursor(owner)
     }
     fn drag_image(
         &self,
@@ -669,6 +673,19 @@ impl Shell for RemoteShell {
         // Types only: the same icons serve remote items.
         self.inner.type_icon(name, is_dir, large)
     }
+    fn registered_type_icon(&self, ext: &str) -> Option<arke_core::thumbs::Thumbnail> {
+        self.inner.registered_type_icon(ext)
+    }
+    fn video_thumbnail(
+        &self,
+        path: &Path,
+        max_side: u32,
+    ) -> Result<Option<arke_core::thumbs::Thumbnail>, ShellError> {
+        if remote(path).is_some() {
+            return Ok(None);
+        }
+        self.inner.video_thumbnail(path, max_side)
+    }
     fn shell_menu(&self, paths: &[PathBuf], background: bool) -> Result<ShellMenu, ShellError> {
         if paths.iter().any(|p| remote(p).is_some()) {
             return Err(ShellError::NotOnRemote);
@@ -690,6 +707,29 @@ impl Shell for RemoteShell {
     }
     fn release_shell_menu(&self, session: u64) {
         self.inner.release_shell_menu(session);
+    }
+    fn shell_menu_handlers(
+        &self,
+        paths: &[PathBuf],
+        background: bool,
+    ) -> Result<Vec<crate::win_menu_parts::MenuHandler>, ShellError> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.shell_menu_handlers(paths, background)
+    }
+    fn shell_menu_handler(
+        &self,
+        paths: &[PathBuf],
+        background: bool,
+        handler: &crate::win_menu_parts::MenuHandler,
+        group: u64,
+    ) -> Result<(ShellMenu, std::time::Duration), ShellError> {
+        if paths.iter().any(|p| remote(p).is_some()) {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner
+            .shell_menu_handler(paths, background, handler, group)
     }
     fn set_clipboard_text(&self, text: &str) -> Result<(), ShellError> {
         self.inner.set_clipboard_text(text)
@@ -748,6 +788,12 @@ impl Shell for RemoteShell {
             return Err(ShellError::NotOnRemote);
         }
         self.inner.run_in(command_line, dir)
+    }
+    fn run_quicklook(&self, exe: Option<&Path>, item: &Path) -> Result<(), ShellError> {
+        if remote(item).is_some() {
+            return Err(ShellError::NotOnRemote);
+        }
+        self.inner.run_quicklook(exe, item)
     }
     fn local_parts(&self, time: SystemTime) -> Option<[u16; 6]> {
         self.inner.local_parts(time)

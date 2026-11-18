@@ -68,7 +68,7 @@ const NOTICE_UNDO_TTL: Duration = Duration::from_secs(10);
 const RENAME_BALLOON_W: Pixels = px(440.);
 /// Above this many selected items the total size isn't computed (avoids a long walk on every
 /// render)
-const SIZE_SUM_MAX: usize = 5_000;
+pub(super) const SIZE_SUM_MAX: usize = 5_000;
 /// Below this pane width the filter box collapses to a magnifier, leaving room for the path
 const NARROW_TOP_BAR: Pixels = px(760.);
 /// Below this pane width context bar buttons show icons only
@@ -785,23 +785,13 @@ impl Explorer {
                 if this.on_row_click(ix, event, cx) {
                     return;
                 }
+                this.on_row_released(ix, event, window, cx);
                 if this.click_select == Some(ix) && event.click_count() == 1 {
                     this.click_select = None;
                     if let Some(view) = this.view() {
                         this.selection.select_only(&view, ix);
                         cx.notify();
                     }
-                }
-                // Clicked the item that was already the only selection: rename after the
-                // double-click time unless something cancels it (Explorer's slow click).
-                if !event.is_keyboard() && event.click_count() == 1 {
-                    this.slow_click_release(ix, window, cx);
-                }
-            }))
-            // Leaving the item while the slow-click wait runs cancels it.
-            .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
-                if !*hovered {
-                    this.slow_click_leave(ix);
                 }
             }))
             // Drop: folders
@@ -882,14 +872,25 @@ impl Explorer {
         entry: &Entry,
         rename_input: Option<(Entity<TextInput>, Option<NameError>)>,
         (in_cloud, sync): (bool, Option<arke_core::entry::CloudSync>),
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let press: NamePress =
+            Box::new(cx.listener(move |this, _: &gpui::MouseDownEvent, _, _| {
+                this.on_name_pressed(ix);
+            }));
         div()
             .flex_1()
             .min_w_0()
             .flex()
             .items_center()
             .gap(theme::S_12)
-            .child(name_cell(entry, rename_input, self.show_extensions, true))
+            .child(name_cell(
+                entry,
+                rename_input,
+                self.show_extensions,
+                true,
+                Some(press),
+            ))
             .children(super::compare::compare_badge(
                 self.compare_mark(&entry.name),
             ))
@@ -909,10 +910,12 @@ impl Explorer {
             })
     }
 
+    /// `tips`: which of the rows get a tooltip with their whole name (column view names cut off).
     pub(super) fn render_rows(
         &mut self,
         range: Range<usize>,
         focused: bool,
+        tips: &[bool],
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let started = Instant::now();
@@ -958,6 +961,9 @@ impl Explorer {
                     .show_checkboxes
                     .then(|| self.item_checkbox(ix, is_selected, cx));
                 self.row_shell(ix, is_selected, is_cursor, focused, cx)
+                    .when(tips.get(k).copied().unwrap_or(false), |d| {
+                        d.tooltip(tooltip(SharedString::from(&*entry.name)))
+                    })
                     .a11y_item(ix, is_selected, cursor == Some(ix), || {
                         self.item_a11y_label(entry)
                     })
@@ -1001,6 +1007,7 @@ impl Explorer {
                                 entry,
                                 rename_input,
                                 (in_cloud, sync.get(&entry.name).copied()),
+                                cx,
                             )),
                     )
                     .when(columns, |d| d.children(Self::column_row_tail(entry)))
@@ -1017,8 +1024,8 @@ impl Explorer {
     }
 
     /// Thumbnails or system icons for visible items (once loaded), and hand the visible range plus
-    /// one page ahead to the media cache.
-    fn media_for(
+    /// a page ahead and a page back to the media cache.
+    pub(crate) fn media_for(
         &mut self,
         entries: &[Entry],
         range: Range<usize>,
@@ -1075,6 +1082,7 @@ impl Explorer {
         extra: Vec<MediaKey>,
         cx: &mut Context<Self>,
     ) -> Vec<Option<Arc<RenderImage>>> {
+        self.folder_sizes_shown(entries, range.clone(), cx);
         let Some(dir) = self.current_path().map(Path::to_path_buf) else {
             return Vec::new();
         };
@@ -1093,10 +1101,8 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> Vec<Option<Arc<RenderImage>>> {
         let dir = dir.to_path_buf();
+        // Elsewhere (network shares) only type icons: they read no file.
         let allowed = self.media_ok(&dir, cx);
-        if !allowed {
-            return Vec::new();
-        }
         let thumb_px = (thumbnails && self.show_thumbnails).then(|| self.thumbnail_px());
         // System icons come at the size they're drawn at, so big tiles stay sharp.
         let icon_px = if thumbnails {
@@ -1105,21 +1111,31 @@ impl Explorer {
             crate::media::LIST_ICON_PX
         };
         let key = |ix: usize| {
-            entries
-                .get(ix)
-                .and_then(|e| MediaKey::sized_icons(&dir, e, thumb_px, icon_px))
+            entries.get(ix).and_then(|e| {
+                if allowed {
+                    MediaKey::sized_icons(&dir, e, thumb_px, icon_px)
+                } else if crate::prefs::system_type_icons() {
+                    // Windows type icons come from their own queue.
+                    None
+                } else {
+                    MediaKey::type_icon(e)
+                }
+            })
         };
         let keys: Vec<Option<MediaKey>> = range.clone().map(key).collect();
+        // A page ahead, then a page back (scrolling back finds them still decoded).
         let prefetch_end = (range.end + range.len()).min(entries.len());
         // Visible items first, then the pictures inside visible folders, then the next page.
+        let prefetch_start = range.start.saturating_sub(range.len());
         let wanted: Vec<MediaKey> = keys
             .iter()
             .flatten()
             .cloned()
             .chain(extra)
             .chain((range.end..prefetch_end).filter_map(key))
+            .chain((prefetch_start..range.start).rev().filter_map(key))
             .collect();
-        self.media.update(cx, |m, _| m.want(wanted));
+        self.media.update(cx, |m, cx| m.want(wanted, cx));
         let media = self.media.read(cx);
         // A thumbnail decoded for another icon size stands in until this size's arrives.
         keys.iter()
@@ -1329,6 +1345,39 @@ impl Explorer {
 
     /// Rows of grid tiles: each row is a contiguous run of items (when grouped, a group's last row
     /// may be partial).
+    /// A tile's name (up to [`grid::MAX_LINES`] lines), or its rename box.
+    fn tile_label(
+        &self,
+        ix: usize,
+        entry: &Entry,
+        rename_input: Option<(Entity<TextInput>, Option<NameError>)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match rename_input {
+            Some(rename) => name_cell(entry, Some(rename), true, false, None),
+            // Wraps like Explorer, up to three lines; a longer name ends in "…" on the last one.
+            None => div()
+                .debug_selector({
+                    let name = Arc::clone(&entry.name);
+                    move || format!("name:{name}")
+                })
+                .w_full()
+                .text_center()
+                .line_clamp(usize::from(grid::MAX_LINES))
+                .text_ellipsis()
+                .text_size(grid::LABEL_SIZE)
+                .line_height(grid::LABEL_LINE)
+                .child(shown_name(entry, self.show_extensions))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &gpui::MouseDownEvent, _, _| {
+                        this.on_name_pressed(ix);
+                    }),
+                )
+                .into_any_element(),
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one tile builder; the folder peek branch tipped it over"
@@ -1379,20 +1428,7 @@ impl Explorer {
                             .map(|(_, rename)| rename.clone());
                         let image = images.get(k).cloned().flatten();
                         let peek = peeks.get(k).cloned().flatten();
-                        let label = match rename_input {
-                            Some(rename) => name_cell(entry, Some(rename), true, false),
-                            // Wraps like Explorer, up to three lines; a longer name ends in "…"
-                            // on the last one.
-                            None => div()
-                                .w_full()
-                                .text_center()
-                                .line_clamp(usize::from(grid::MAX_LINES))
-                                .text_ellipsis()
-                                .text_size(grid::LABEL_SIZE)
-                                .line_height(grid::LABEL_LINE)
-                                .child(shown_name(entry, self.show_extensions))
-                                .into_any_element(),
-                        };
+                        let label = self.tile_label(ix, entry, rename_input, cx);
                         // Folder compare badge in the tile's top-right
                         let badge = super::compare::compare_badge(self.compare_mark(&entry.name))
                             .map(|badge| {
@@ -1507,9 +1543,12 @@ impl Explorer {
             "files",
             self.display_len(len) + tail_items(self.row_height()),
             cx.processor(
-                move |this, range: Range<usize>, _window, cx| match this.groups() {
-                    Some(groups) => this.render_grouped_rows(&groups, range, focused, cx),
-                    None => this.render_rows(range, focused, cx),
+                move |this, range: Range<usize>, window, cx| {
+                    if let Some(groups) = this.groups() {
+                        return this.render_grouped_rows(&groups, range, focused, cx);
+                    }
+                    let tips = this.column_name_tips(range.clone(), window);
+                    this.render_rows(range, focused, &tips, cx)
                 },
             ),
         )
@@ -1774,6 +1813,10 @@ impl Explorer {
                                     .gap(theme::S_12)
                                     .child(
                                         div()
+                                            .debug_selector({
+                                                let name = Arc::clone(&entry.name);
+                                                move || format!("name:{name}")
+                                            })
                                             .when(hit.snippet.is_some(), |d| {
                                                 d.flex_none().max_w(px(240.))
                                             })
@@ -2033,6 +2076,7 @@ impl Explorer {
                     let list = self.details_list(view_len.unwrap_or(0), focused, cx);
                     if self.columns_active() {
                         div()
+                            .relative()
                             .flex()
                             .flex_1()
                             .min_h_0()
@@ -2046,6 +2090,7 @@ impl Explorer {
                                     .pt(theme::S_4)
                                     .child(list),
                             )
+                            .child(self.render_parent_divider(cx))
                             .into_any_element()
                     } else {
                         list
@@ -2106,12 +2151,10 @@ impl Explorer {
                 accept_drops_into(d, here, cx)
             })
             .on_action(cx.listener(Self::open_context_menu_action))
-            // Any key, or scrolling the list, ends a pending slow-click rename.
-            .capture_key_down(cx.listener(|this, _: &gpui::KeyDownEvent, _, _| {
-                this.slow_click_cancel();
-            }))
+            // Scrolling the list ends a pending click-to-rename (a key does too, in
+            // `on_list_key_down`).
             .on_scroll(cx.listener(|this, _: &gpui::ScrollEvent, _, _| {
-                this.slow_click_cancel();
+                this.cancel_click_rename();
             }))
             .on_key_down(cx.listener(Self::on_list_key_down))
             .on_action(cx.listener(Self::select_prev))
@@ -2134,6 +2177,15 @@ impl Explorer {
             .on_action(cx.listener(Self::open_location))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(|this, _: &super::LookZoomIn, window, cx| {
+                this.look_zoom_key(Some(1), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &super::LookZoomOut, window, cx| {
+                this.look_zoom_key(Some(-1), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &super::LookZoomReset, window, cx| {
+                this.look_zoom_key(None, window, cx);
+            }))
             .child(body)
             .children(self.render_marquee(cx))
             .child(Self::render_zoom_capture(cx))
@@ -2948,9 +3000,11 @@ fn segment(
 
 /// Window buttons styled like the other icon buttons (rounded, same stroke), not imitating Windows.
 /// Clicks are still handled by the system (`WindowControlArea`), so maximize gets the Windows 11
-/// snap layouts menu.
+/// snap layouts menu. Maximized, they also take the screen edge above them and Close the corner
+/// (`caption.rs`).
 pub(crate) fn caption_buttons(window: &Window) -> impl IntoElement {
     let maximized = window.is_maximized();
+    let gap = theme::S_2;
     let button = |id: &'static str, icon: Icon, area: WindowControlArea, close: bool| {
         div()
             .id(id)
@@ -2970,11 +3024,16 @@ pub(crate) fn caption_buttons(window: &Window) -> impl IntoElement {
             .window_control_area(area)
             .when(!close, |d| d.hover(|s| s.bg(theme::wash_strong())))
             .when(close, |d| d.hover(|s| s.bg(theme::danger())))
+            .child(crate::caption::edge_hit(area, close, gap))
             .child(
                 svg()
                     .path(icon.path())
                     .size(theme::ICON)
-                    .text_color(theme::text_muted())
+                    .text_color(if close && crate::caption::close_edge_hovered() {
+                        theme::on_signal()
+                    } else {
+                        theme::text_muted()
+                    })
                     .when(close, |d| {
                         d.group_hover(id, |s| s.text_color(theme::on_signal()))
                     }),
@@ -2984,7 +3043,7 @@ pub(crate) fn caption_buttons(window: &Window) -> impl IntoElement {
         .flex()
         .flex_none()
         .items_center()
-        .gap(theme::S_2)
+        .gap(gap)
         .pl(theme::S_8)
         .child(button(
             "win-min",
@@ -3035,17 +3094,23 @@ fn names_in(entries: &[Entry], range: Range<usize>) -> Vec<Arc<str>> {
         .collect()
 }
 
+/// Listener for a press on an item's name.
+type NamePress = Box<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App)>;
+
 /// Name text, or the inline rename box with its problem message (if any) underneath.
 ///
 /// `in_row`: Details rows pull the box left by its inset, so the text stays exactly where the
 /// name was drawn instead of jumping right when renaming starts (grid tiles center the name, so
 /// they don't need it). In a tile the box spans the tile's width: tiles center their children,
 /// so without a width it would shrink to its border and hide the name (#38).
+///
+/// `on_press`: a press on the name itself (not the space after it), for click-to-rename (#89).
 fn name_cell(
     entry: &Entry,
     rename: Option<(Entity<TextInput>, Option<NameError>)>,
     show_ext: bool,
     in_row: bool,
+    on_press: Option<NamePress>,
 ) -> AnyElement {
     match rename {
         Some((input, problem)) => div()
@@ -3089,8 +3154,20 @@ fn name_cell(
         None => div()
             .flex_1()
             .min_w_0()
-            .truncate()
-            .child(shown_name(entry, show_ext))
+            .flex()
+            .child(
+                div()
+                    .debug_selector({
+                        let name = Arc::clone(&entry.name);
+                        move || format!("name:{name}")
+                    })
+                    .min_w_0()
+                    .truncate()
+                    .child(shown_name(entry, show_ext))
+                    .when_some(on_press, |d, press| {
+                        d.on_mouse_down(MouseButton::Left, press)
+                    }),
+            )
             .into_any_element(),
     }
 }
@@ -3404,7 +3481,7 @@ impl Explorer {
         let window_w = window.viewport_size().width;
         // A split tab's shared preview takes its room first; the panes share the rest.
         self.paper_width =
-            (window_w - crate::prefs::sidebar_width() - self.pane.reserve) * self.pane.share;
+            (window_w - theme::sidebar_width() - self.pane.reserve) * self.pane.share;
         self.bar_width = self.paper_width
             + if self.pane.trailing {
                 self.pane.reserve
@@ -3418,13 +3495,26 @@ impl Explorer {
             } else {
                 px(0.)
             };
-        self.cols = self.compute_columns();
+        // While a column divider is dragged, Name keeps its width: fitting it to the other
+        // columns live would move the dragged column's left edge, which the drag measures from.
+        // It fits again on release.
+        let held_name = (self.column_resized && cx.has_active_drag())
+            .then(|| self.cols.map(|c| c.name))
+            .flatten();
+        self.cols = self.compute_columns(held_name);
         self.header_x.set(None);
         // Preview pane edge released: save the width (app-wide).
         if self.preview_resized && !cx.has_active_drag() {
             let this = cx.entity().downgrade();
             cx.defer(move |cx| {
                 let _ = this.update(cx, Self::save_preview_width);
+            });
+        }
+        // Column view divider released: save the column widths (app-wide).
+        if self.view_column_resized.is_some() && !cx.has_active_drag() {
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, Self::save_view_column_widths);
             });
         }
         self.poll_pending_create(cx);
@@ -3589,7 +3679,7 @@ impl Explorer {
 
     /// What [`layout::fit`] needs to know about this pane.
     pub(super) fn fit_input(&self, bar: Pixels, window: Pixels) -> layout::FitInput {
-        layout::FitInput {
+        let mut input = layout::FitInput {
             bar,
             window,
             details: self.view_mode == ViewMode::Details && !self.search_mode,
@@ -3599,7 +3689,8 @@ impl Explorer {
             // A split tab's preview pane is drawn once for the tab, not by each side.
             wants_preview: (self.preview_pane && !self.pane.split) || self.columns_active(),
             preview_user: crate::prefs::preview_width(),
-            parent_w: super::columns::PARENT_W,
+            parent_w: Self::parent_column_width(),
+            current_w: crate::prefs::view_column_width(crate::prefs::ViewColumn::Current),
             location_w: theme::COL_LOCATION,
             col_w: crate::prefs::Col::ALL.map(|col| {
                 // Search results always show modified and size.
@@ -3612,7 +3703,10 @@ impl Explorer {
                 };
                 on.then(|| crate::prefs::width(col))
             }),
-        }
+        };
+        // The parent column's width is shared by all panes: never more than this one leaves it.
+        input.parent_w = input.parent_w.min(layout::parent_room(&input));
+        input
     }
 
     /// Preview pane slides in from the right when it is turned on (not when a tab showing it is
@@ -3627,6 +3721,7 @@ impl Explorer {
             self.preview_cue.wrap(
                 div()
                 .id("preview-pane")
+                .debug_selector(|| "preview-pane".to_owned())
                 .a11y(gpui::Role::Region, t!("settings.preview"))
                 .when_some(
                     description,

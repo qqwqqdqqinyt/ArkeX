@@ -5,6 +5,7 @@
 //! - the preview pane's width for a window size, or the width the user dragged it to
 //!   ([`preview_width`]), and how wide it may be dragged ([`preview_room`]),
 //! - how wide a split tab's shared preview is ([`shared_preview`]),
+//! - how wide the column view's columns may be dragged ([`parent_room`], [`current_room`]),
 //! - which breadcrumb segments collapse into "…" ([`collapse_crumbs`]).
 //!
 //! Details columns work like File Explorer's: laid out left to right from Name, each with its own
@@ -46,6 +47,12 @@ pub(super) const ROW_CHROME: Pixels = px(16. + 16. + 24. + 12. + 16. + 16. + 12.
 /// What a pane's box loses before its rows: the paper's outer margins, the list's side padding
 /// and [`LIST_GUTTER`].
 pub(super) const LIST_CHROME: Pixels = px(16. + 16. + 24.);
+/// The paper's right margin (its left edge touches the sidebar or the split divider): a pane's
+/// box less this is the list and the preview pane.
+pub(super) const PAPER_MARGIN: Pixels = theme::S_8;
+/// Column view: narrowest a column can be dragged, and the bounds of fitting one to its names.
+pub(super) const VIEW_COLUMN_MIN: Pixels = px(160.);
+pub(super) const VIEW_COLUMN_FIT_MAX: Pixels = px(600.);
 
 /// A Details row's geometry: the Name column's width (its checkbox, tree indent and icon
 /// included) and the whole row's, padding included. Rows, their selection wash and the header
@@ -56,22 +63,20 @@ pub(super) struct Columns {
     pub(super) row: Pixels,
 }
 
-/// What the default columns (Modified, Type and Size, with their gaps and the row's padding)
-/// take next to Name; the automatic Name width is what's left of the pane after them.
-const DEFAULT_OTHERS: Pixels = px(12. + 16. + (12. + 140.) + (12. + 130.) + (12. + 84.));
-
 /// The Details columns in a list with `room` for rows (the pane less [`LIST_CHROME`]). `name` is
-/// the width the user gave the Name column; until then it takes what the default columns would
-/// leave, kept between [`theme::COL_NAME`] and [`theme::COL_NAME_MAX`] so it's roomy in a wide
-/// window without pushing the other columns far away. It follows the pane only, never the other
-/// columns (`others`, left to right), so sizing one of them never moves Name's edge.
+/// the width the user gave the Name column; until then it takes what the other columns
+/// (`others`, left to right, as shown and sized) leave, kept between [`theme::COL_NAME`] and
+/// [`theme::COL_NAME_MAX`] so it's roomy in a wide window without pushing the other columns far
+/// away. So Name gives way first when the pane narrows (the preview pane widens, a column is
+/// switched on or sized wider); only once it's at its minimum do the columns scroll.
 pub(super) fn columns(room: Pixels, name: Option<Pixels>, others: &[Pixels]) -> Columns {
     let rest = others.iter().fold(px(0.), |sum, w| sum + COL_GAP + *w);
+    let pad = ROW_PAD_L + ROW_PAD_R;
     let name =
-        name.unwrap_or_else(|| (room - DEFAULT_OTHERS).clamp(theme::COL_NAME, theme::COL_NAME_MAX));
+        name.unwrap_or_else(|| (room - pad - rest).clamp(theme::COL_NAME, theme::COL_NAME_MAX));
     Columns {
         name,
-        row: ROW_PAD_L + ROW_PAD_R + name + rest,
+        row: pad + name + rest,
     }
 }
 
@@ -119,6 +124,9 @@ pub(super) struct FitInput {
     pub(super) preview_user: Option<Pixels>,
     /// Width of the parent column in column view.
     pub(super) parent_w: Pixels,
+    /// Column view: the width the user gave the current folder's column (`None`: it fills what
+    /// the preview leaves). Set, the preview takes the rest instead.
+    pub(super) current_w: Option<Pixels>,
     /// Location column in search results.
     pub(super) location_w: Pixels,
     /// Each Details column's width, by [`Col`] (`None` when switched off; Name is ignored).
@@ -154,6 +162,10 @@ fn list_min(input: &FitInput) -> Pixels {
     }
     // Search modified/size are always shown; fall back to the default widths if switched off.
     if input.columns_view {
+        // A current folder column the user made narrower than that is its own minimum.
+        if let Some(current) = input.current_w {
+            fixed = fixed.min(PAPER_MARGIN + current);
+        }
         fixed += input.parent_w;
     } else if input.search {
         let modified = width(Col::Modified).unwrap_or(theme::COL_MODIFIED);
@@ -170,7 +182,14 @@ fn list_min(input: &FitInput) -> Pixels {
 /// Decides whether and how wide the preview pane shows (see [`Fit`]).
 pub(super) fn fit(input: &FitInput) -> Fit {
     let list = list_min(input);
-    let preview_w = preview_width(input.window, input.preview_user);
+    let preview_w = match input.current_w {
+        // Like Finder's last column: the sized columns keep their widths, the preview gets the
+        // rest (so the current column comes out exactly as wide as the user made it).
+        Some(current) if input.columns_view => {
+            (input.bar - PAPER_MARGIN - input.parent_w - current).max(PREVIEW_MIN)
+        }
+        _ => preview_width(input.window, input.preview_user),
+    };
     if input.wants_preview {
         if input.bar - preview_w >= list {
             return Fit {
@@ -241,6 +260,31 @@ pub(super) fn bare_list(input: &FitInput) -> Pixels {
     list_min(input)
 }
 
+/// What a shown preview needs while a column view column is sized: its minimum.
+fn preview_keep(input: &FitInput) -> Pixels {
+    if input.wants_preview && fit(input).preview {
+        PREVIEW_MIN
+    } else {
+        px(0.)
+    }
+}
+
+/// Column view: widest the parent column may be dragged, so the current folder's column keeps
+/// its minimum (see [`list_min`]) and a shown preview keeps [`PREVIEW_MIN`].
+pub(super) fn parent_room(input: &FitInput) -> Pixels {
+    let others = list_min(&FitInput {
+        parent_w: px(0.),
+        ..*input
+    });
+    (input.bar - others - preview_keep(input)).max(VIEW_COLUMN_MIN)
+}
+
+/// Column view: widest the current folder's column may be made, leaving a shown preview its
+/// minimum.
+pub(super) fn current_room(input: &FitInput) -> Pixels {
+    (input.bar - PAPER_MARGIN - input.parent_w - preview_keep(input)).max(VIEW_COLUMN_MIN)
+}
+
 /// Breadcrumb segments to hide behind "…" so the path fits in `avail`.
 ///
 /// `widths` are the segments' drawn widths (each with its leading ›), `more` the width of the
@@ -294,7 +338,7 @@ mod tests {
     fn input(bar: f32) -> FitInput {
         FitInput {
             bar: px(bar),
-            window: px(bar) + theme::SIDEBAR_W,
+            window: px(bar) + theme::sidebar_width(),
             details: true,
             checkboxes: false,
             columns_view: false,
@@ -302,6 +346,7 @@ mod tests {
             wants_preview: false,
             preview_user: None,
             parent_w: px(220.),
+            current_w: None,
             location_w: theme::COL_LOCATION,
             col_w: widths(&[
                 (Col::Modified, theme::COL_MODIFIED),
@@ -410,16 +455,12 @@ mod tests {
         assert_eq!(wide.row - narrow.row, px(60.));
     }
 
-    /// Until the user sizes it, Name takes what the default columns leave, between its bounds: a
+    /// Until the user sizes it, Name takes what the other columns leave, between its bounds: a
     /// wide window gets a roomy name and blank space after the columns, a narrow one the minimum
-    /// (and scrolls sideways). Other columns' widths don't move it.
+    /// (and scrolls sideways). A wider or an extra column takes its room from Name.
     #[test]
     fn the_default_name_width_follows_the_room() {
         let rest = OTHERS.iter().fold(px(0.), |s, w| s + COL_GAP + *w) + ROW_PAD_L + ROW_PAD_R;
-        assert_eq!(
-            rest, DEFAULT_OTHERS,
-            "in step with the theme's default widths"
-        );
         let mid = columns(rest + px(380.), None, &OTHERS);
         assert_eq!(mid.name, px(380.));
         assert_eq!(mid.row, rest + px(380.), "fills the room exactly");
@@ -427,11 +468,18 @@ mod tests {
         assert_eq!(wide.name, theme::COL_NAME_MAX);
         assert!(wide.row < px(2400.), "blank background after the columns");
         let wider = [theme::COL_MODIFIED, theme::COL_TYPE, px(200.)];
-        assert_eq!(
-            columns(rest + px(380.), None, &wider).name,
-            px(380.),
-            "a wider Size doesn't squeeze the name"
-        );
+        let c = columns(rest + px(380.), None, &wider);
+        assert_eq!(c.name, px(380.) - (px(200.) - theme::COL_SIZE));
+        assert_eq!(c.row, rest + px(380.), "a wider Size still fits");
+        let more = [
+            theme::COL_MODIFIED,
+            theme::COL_MODIFIED,
+            theme::COL_TYPE,
+            theme::COL_SIZE,
+        ];
+        let c = columns(rest + px(420.), None, &more);
+        assert_eq!(c.name, px(420.) - COL_GAP - theme::COL_MODIFIED);
+        assert_eq!(c.row, rest + px(420.), "so does an extra column");
         let narrow = columns(px(300.), None, &OTHERS);
         assert_eq!(narrow.name, theme::COL_NAME);
         assert!(
@@ -447,7 +495,7 @@ mod tests {
         let with_preview = |bar: Pixels| {
             let mut i = input(0.);
             i.bar = bar;
-            i.window = bar + theme::SIDEBAR_W;
+            i.window = bar + theme::sidebar_width();
             i.wants_preview = true;
             fit(&i)
         };
@@ -463,6 +511,52 @@ mod tests {
         let f = with_preview(bare() + PREVIEW_MIN - px(1.));
         assert!(!f.preview, "{f:?}");
         assert!(!fit(&input(1400.)).preview, "only when switched on");
+    }
+
+    /// Column view with a sized current column: the preview takes what the two columns leave,
+    /// down to its minimum (the current column gives way after that), then hides. Unsized, the
+    /// preview keeps its own width as before.
+    #[test]
+    fn column_view_preview_takes_what_the_columns_leave() {
+        let columns = |bar: f32, current: Option<f32>| {
+            let mut i = input(bar);
+            i.details = false;
+            i.columns_view = true;
+            i.wants_preview = true;
+            i.parent_w = px(240.);
+            i.current_w = current.map(px);
+            i
+        };
+        let f = fit(&columns(1400., Some(300.)));
+        assert!(
+            f.preview && f.preview_w == px(1400. - 8. - 240. - 300.),
+            "{f:?}"
+        );
+        let f = fit(&columns(1400., None));
+        assert_eq!(
+            f.preview_w,
+            preview_width(px(1400.) + theme::sidebar_width(), None)
+        );
+        // No room left for the preview's minimum: it stays at that while the list keeps its own.
+        let f = fit(&columns(800., Some(400.)));
+        assert!(f.preview && f.preview_w == PREVIEW_MIN, "{f:?}");
+        assert!(!fit(&columns(500., Some(400.))).preview);
+        // A narrow current column is its own minimum, so a small pane keeps the preview.
+        let f = fit(&columns(8. + 240. + 160. + 300., Some(160.)));
+        assert!(f.preview && f.preview_w == px(300.), "{f:?}");
+        // Dragging stops where the preview would go below its minimum.
+        let i = columns(1400., Some(300.));
+        assert_eq!(current_room(&i), px(1400. - 8. - 240.) - PREVIEW_MIN);
+        // The parent may take room until the current column is down to its own width.
+        assert_eq!(
+            parent_room(&i),
+            px(1400.) - PAPER_MARGIN - px(300.) - PREVIEW_MIN
+        );
+        assert_eq!(
+            parent_room(&columns(1400., None)),
+            px(1400.) - ROW_CHROME - NAME_MIN - PREVIEW_MIN
+        );
+        assert_eq!(parent_room(&columns(300., None)), VIEW_COLUMN_MIN);
     }
 
     fn crumbs(widths: &[f32]) -> Vec<Pixels> {

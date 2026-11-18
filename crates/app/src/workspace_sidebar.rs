@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    AnimationExt, AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, MouseButton,
-    MouseDownEvent, Pixels, Point, SharedString, Window, anchored, deferred, div, prelude::*, px,
-    relative, svg,
+    AnimationExt, AnyElement, App, ClickEvent, Context, Div, Entity, ExternalPaths, MouseButton,
+    MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Stateful, Window, anchored,
+    deferred, div, prelude::*, px, relative, svg,
 };
 use rust_i18n::t;
 
@@ -77,6 +77,8 @@ pub(super) enum SidebarAction {
     OpenSettings,
     OpenRecycleInNewTab,
     SetRecyclePinned(bool),
+    /// The collapsed sidebar opens over the content on hover (#122).
+    SetSidebarPeek(bool),
     /// Copy or move the shelf's items into the active tab's folder.
     ShelfToHere {
         is_move: bool,
@@ -149,7 +151,7 @@ fn has_subfolder(fs: &dyn arke_core::Fs, dir: &Path) -> bool {
 }
 
 /// Display name: the folder name, or the full path for a drive root (C:\).
-fn display_name(path: &Path) -> String {
+pub(super) fn display_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -179,6 +181,52 @@ pub(super) const fn known_icon(kf: KnownFolder) -> Icon {
         KnownFolder::Videos => Icon::KfVideos,
     }
 }
+
+/// How much more readily the tab list shrinks than the places above it when the sidebar runs out
+/// of room (flex shrink factors): it gives way to its minimum before the places shrink.
+pub(super) const TABS_GIVE_WAY: f32 = 1000.;
+
+/// `items` in `list`, scrolling on its own inside `frame` (which sets its size). A row cut off by the
+/// bottom edge is dimmed, the more of it is hidden the more, so it reads as going on below rather
+/// than broken. (A gradient over it can't match the Mica background.)
+pub(super) fn scrolling(
+    list: Stateful<Div>,
+    items: Vec<AnyElement>,
+    scroll: &ScrollHandle,
+    frame: Div,
+) -> Div {
+    // Row positions are laid out unscrolled (from the last frame); the bottom edge in those terms
+    // follows the current scroll.
+    let edge = scroll.bounds().bottom() - scroll.offset().y;
+    let items = items.into_iter().enumerate().map(|(ix, item)| {
+        match scroll
+            .bounds_for_item(ix)
+            .filter(|b| b.top() < edge && b.bottom() > edge + px(0.5))
+        {
+            Some(row) => {
+                let hidden = ((row.bottom() - edge) / row.size.height).clamp(0., 1.);
+                div()
+                    .flex()
+                    .flex_col()
+                    .opacity(CUT_ROW_OPACITY.0 + CUT_ROW_OPACITY.1 * (1. - hidden))
+                    .child(item)
+                    .into_any_element()
+            }
+            None => item,
+        }
+    });
+    frame.flex().flex_col().child(
+        list.flex_initial()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(scroll)
+            .children(items),
+    )
+}
+
+/// Opacity of a row cut off at the bottom of a scrolling list: base plus this much times the
+/// visible fraction.
+const CUT_ROW_OPACITY: (f32, f32) = (0.2, 0.5);
 
 fn section_label(text: impl Into<SharedString>) -> impl IntoElement {
     let text: SharedString = text.into();
@@ -673,19 +721,17 @@ impl Workspace {
             return out;
         }
         out.extend(list_drop.map(IntoElement::into_any_element));
-        // One parent for the pinned rows, so a folder pinned and also shown under This PC doesn't
-        // repeat an element id (the screen reader tree needs them unique).
-        if !pinned_rows.is_empty() {
-            out.push(
-                div()
-                    .id("pinned")
-                    .flex()
-                    .flex_col()
-                    .gap(theme::S_2)
-                    .children(pinned_rows)
-                    .into_any_element(),
-            );
-        }
+        // A parent for each pinned row, so a folder pinned and also shown under This PC doesn't
+        // repeat an element id (the screen reader tree needs them unique). Each row stays its own
+        // item of the scrolling list, so one cut off at its bottom is dimmed alone.
+        out.extend(pinned_rows.into_iter().enumerate().map(|(ix, row)| {
+            div()
+                .id(("pinned", ix))
+                .flex()
+                .flex_col()
+                .child(row)
+                .into_any_element()
+        }));
         out
     }
 
@@ -727,26 +773,32 @@ impl Workspace {
 
         let tab_count = tabs.len();
         // Places (pins, This PC, Network) and the vertical tab list each scroll on their own. When
-        // the window is short, both shrink (each by its share of the height) instead of the tabs
-        // falling below the fold, where nothing showed they were there. With room to spare,
-        // nothing changes: the places take their height and the tabs follow right under them.
+        // they don't both fit, the tab list gives way first, down to three tabs, so opening many
+        // tabs doesn't squeeze the places; only then do the places shrink too. The tabs never
+        // fall below the fold, where nothing showed they were there. With room to spare, nothing
+        // changes: the places take their height and the tabs follow right under them.
         let horizontal = Self::horizontal_tabs(cx);
-        let places_area = div()
-            .id("sidebar-places")
-            .flex()
-            .flex_col()
-            // With tabs on top there is nothing below, so the places fill the sidebar.
-            .when(horizontal, gpui::Styled::flex_1)
-            .when(!horizontal, gpui::Styled::flex_initial)
-            // At least two rows stay visible, so it's clear this part scrolls too.
-            .min_h(theme::H_ROW * 2.)
-            .gap(theme::S_2)
-            .overflow_y_scroll()
-            .children(pins)
-            .children(self.render_shelf(cx))
-            .child(self.section_header("this_pc", t!("sidebar.this_pc"), cx))
-            .children(devices)
-            .children(network);
+        let mut items = pins;
+        items.extend(self.render_shelf(cx));
+        items.push(
+            self.section_header("this_pc", t!("sidebar.this_pc"), cx)
+                .into_any_element(),
+        );
+        items.extend(devices);
+        items.extend(network);
+        let places = div().id("sidebar-places").flex().flex_col().gap(theme::S_2);
+        let places_area = scrolling(
+            places,
+            items,
+            &self.sidebar_ui.places_scroll,
+            div()
+                .debug_selector(|| "sidebar-places-frame".to_owned())
+                // With tabs on top there is nothing below, so the places fill the sidebar.
+                .when(horizontal, gpui::Styled::flex_1)
+                .when(!horizontal, gpui::Styled::flex_initial)
+                // At least two rows stay visible, so it's clear this part scrolls too.
+                .min_h(theme::H_ROW * 2.),
+        );
         div()
             .id("sidebar")
             .a11y(gpui::Role::Tree, t!("a11y.sidebar"))
@@ -777,21 +829,24 @@ impl Workspace {
                             None => Self::render_new_tab_row(cx).into_any_element(),
                         }),
                     )
-                    .child(
+                    .child(scrolling(
                         div()
                             .id("tab-list")
                             .a11y(gpui::Role::TabList, t!("sidebar.tabs"))
                             .flex()
                             .flex_col()
-                            .flex_initial()
-                            // Keeps up to three tabs in view however short the window gets.
-                            .min_h(Self::tab_list_min_height(tab_count))
                             .gap(theme::S_2)
-                            .overflow_y_scroll()
-                            .children(tabs)
                             // Dropping in the gaps between tabs moves the tab to the end.
                             .on_drop(cx.listener(Self::drop_tab_at_end)),
-                    )
+                        tabs,
+                        &self.sidebar_ui.tabs_scroll,
+                        // Keeps up to three tabs in view however short the window gets.
+                        div()
+                            .debug_selector(|| "sidebar-tabs-frame".to_owned())
+                            .flex_initial()
+                            .flex_shrink(TABS_GIVE_WAY)
+                            .min_h(Self::tab_list_min_height(tab_count)),
+                    ))
                     // Dropping in the empty space below the last tab moves it to the end.
                     .child(
                         div()
@@ -801,6 +856,12 @@ impl Workspace {
                             .on_drop(cx.listener(Self::drop_tab_at_end)),
                     )
             })
+    }
+
+    /// How far the sidebar's places scroll past what is shown (tests).
+    #[cfg(test)]
+    pub(crate) fn places_overflow_for_test(&self) -> Pixels {
+        self.sidebar_ui.places_scroll.max_offset().y
     }
 
     /// Height the vertical tab list keeps when the sidebar runs out of room: up to three tabs.
@@ -1430,6 +1491,7 @@ impl Workspace {
             | SidebarAction::ShelfReveal(_) => self.run_shelf_action(&action, window, cx),
             SidebarAction::OpenRecycleInNewTab => self.open_recycle(true, window, cx),
             SidebarAction::SetRecyclePinned(pinned) => Self::set_recycle_pinned(pinned, cx),
+            SidebarAction::SetSidebarPeek(on) => Self::set_sidebar_peek(on, cx),
             SidebarAction::OpenInNewTab(path) => {
                 let at = self.active + 1;
                 self.open_tab(path, at, true, window, cx);
@@ -1701,14 +1763,14 @@ impl Workspace {
                             .text_size(theme::FS_14)
                             .text_color(theme::text())
                             .children(rows)
-                            // Like the list's context menu: slides down and fades in, again for
-                            // each new right-click position.
+                            // Like the list's context menu: fades in, again for each new
+                            // right-click position.
                             .with_animation(
                                 gpui::ElementId::Name(
                                     format!("sidebar-menu-{:?}", menu.position).into(),
                                 ),
-                                crate::motion::enter(),
-                                |el, t| crate::motion::slide_in(el, t, 0., -crate::motion::SLIDE),
+                                crate::motion::menu_enter(),
+                                crate::motion::fade_in,
                             ),
                     ),
             )

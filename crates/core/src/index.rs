@@ -46,12 +46,22 @@ const FLAG_LINK: u8 = 4;
 /// A real folder whose contents are not in the index (build folders, exclusions, hidden system
 /// folders, cloud placeholder folders).
 const FLAG_PRUNED: u8 = 8;
-/// Folders never entered: the system recycle bin, restore data and Windows Update staging.
-const SKIP_DIRS: [&str; 4] = [
+/// Folders never entered: the system recycle bin, restore data and Windows Update staging, and on
+/// NAS shares their snapshots (each a full copy of the share), recycle bins and thumbnail caches
+/// (Synology, QNAP, NetApp and others).
+const SKIP_DIRS: [&str; 12] = [
     "$recycle.bin",
     "system volume information",
     "$windows.~bt",
     "$windows.~ws",
+    "#snapshot",
+    "#recycle",
+    "@eadir",
+    "@recycle",
+    "@recently-snapshot",
+    ".@__thumb",
+    ".snapshot",
+    "~snapshot",
 ];
 /// Build output and package cache folders (not entered with "skip build folders", but the folder
 /// itself stays findable): often hundreds of thousands of churning files nobody searches for.
@@ -215,6 +225,9 @@ pub struct BuildRules {
     pub skip_build_dirs: bool,
     /// User-excluded folders: the folder itself is findable, its contents are not indexed.
     pub excluded: Vec<PathBuf>,
+    /// Stop entering folders once the index holds this many items (network shares, which can be
+    /// far larger than anyone searches); `None` for no limit.
+    pub max_items: Option<usize>,
 }
 
 /// Path comparison key: lowercase, no trailing `\`.
@@ -291,9 +304,10 @@ pub struct Index {
     skipped_build_dirs: bool,
     /// Exclusions used for the build ([`BuildRules::fingerprint`]; 0 for none).
     excluded_hash: u32,
-    /// Build-time only: name hash -> existing span in the string pool (each name stored once).
-    /// Dropped after the build.
-    dedup: Option<HashMap<u64, (u32, u16)>>,
+    /// Build-time only: one node per distinct name, found by [`name_hash`], so each name is
+    /// stored once in the pool. Holds just the node id (4 bytes a name; a map keyed by the hash
+    /// would take 16). Dropped after the build.
+    dedup: Option<hashbrown::HashTable<u32>>,
 }
 
 /// Build progress: items listed so far.
@@ -301,6 +315,9 @@ pub struct Index {
 pub struct BuildProgress {
     /// Items listed so far; updated from the walker threads.
     pub scanned: AtomicUsize,
+    /// Items and name bytes of the index this build replaces (0 for a first build). Memory for
+    /// about that much is set aside up front instead of growing into it.
+    pub expected: (AtomicUsize, AtomicUsize),
 }
 
 /// One query.
@@ -317,6 +334,8 @@ pub struct Search<'a> {
     pub within: Option<&'a [u32]>,
     /// Return every match (for narrowing the next query).
     pub collect_matched: bool,
+    /// Set by the caller to give up (a newer query replaced this one); checked between chunks.
+    pub cancel: Option<&'a AtomicBool>,
 }
 
 /// Output of [`Index::search`].
@@ -325,6 +344,29 @@ pub struct SearchResult {
     pub hits: Vec<IndexHit>,
     /// All matching ids, ascending; only with `collect_matched`.
     pub matched: Option<Vec<u32>>,
+    /// Stopped early through [`Search::cancel`]: `hits` and `matched` are incomplete.
+    pub cancelled: bool,
+}
+
+/// Threads that scan the index for queries, started on the first query and kept: starting a
+/// thread per core for every keystroke cost more than scanning millions of names.
+fn scan_pool() -> Option<&'static rayon_core::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon_core::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        rayon_core::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("index-scan-{i}"))
+            .build()
+            .inspect_err(|err| log::warn!("no search thread pool, scanning on one thread: {err}"))
+            .ok()
+    })
+    .as_ref()
+}
+
+thread_local! {
+    /// Scan scratch kept per pool thread (the matcher allocates on creation).
+    static WORK: std::cell::RefCell<Option<Work>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn unix_secs(time: SystemTime) -> u64 {
@@ -344,6 +386,11 @@ impl Index {
     /// No items at all.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Bytes of the name pool (each distinct name once).
+    pub fn name_bytes(&self) -> usize {
+        self.names.len()
     }
 
     /// Root paths this index covers, in build order.
@@ -399,21 +446,31 @@ impl Index {
         let name_len = u16::try_from(name.len()).ok()?;
         // Repeated names (`index.js`, `package.json`, `mod.rs`...) are stored once in the pool,
         // which saves more than half on a developer's disk.
-        let key = self.dedup.as_ref().map(|_| name_hash(name));
-        let known = key.and_then(|k| {
-            let &(start, len) = self.dedup.as_ref()?.get(&k)?;
-            let start_ix = start as usize;
-            (len == name_len && self.names.get(start_ix..start_ix + len as usize) == Some(name))
-                .then_some(start)
-        });
-        let name_start = if let Some(start) = known {
-            start
+        let name_start = if let Some(dedup) = self.dedup.as_mut() {
+            let (nodes, names) = (&*self.nodes, &*self.names);
+            let name_of = |id: u32| {
+                let node = nodes[id as usize];
+                let start = node.name_start as usize;
+                &names[start..start + node.name_len as usize]
+            };
+            match dedup.entry(
+                name_hash(name),
+                |&id| name_of(id) == name,
+                |&id| name_hash(name_of(id)),
+            ) {
+                hashbrown::hash_table::Entry::Occupied(known) => {
+                    nodes[*known.get() as usize].name_start
+                }
+                hashbrown::hash_table::Entry::Vacant(slot) => {
+                    let start = u32::try_from(names.len()).ok()?;
+                    slot.insert(id);
+                    self.names.push_str(name);
+                    start
+                }
+            }
         } else {
             let start = u32::try_from(self.names.len()).ok()?;
             self.names.push_str(name);
-            if let (Some(k), Some(map)) = (key, self.dedup.as_mut()) {
-                map.entry(k).or_insert((start, name_len));
-            }
             start
         };
         self.nodes.push(Node {
@@ -463,7 +520,7 @@ impl Index {
             thread_init,
             &BuildRules {
                 skip_build_dirs,
-                excluded: Vec::new(),
+                ..BuildRules::default()
             },
             &|_, _| Err(io::ErrorKind::Unsupported.into()),
         )
@@ -492,9 +549,12 @@ impl Index {
             built_at: unix_secs(SystemTime::now()),
             skipped_build_dirs: rules.skip_build_dirs,
             excluded_hash: rules.fingerprint(),
-            dedup: Some(HashMap::new()),
             ..Self::default()
         };
+        index.reserve(
+            progress.expected.0.load(Ordering::Relaxed),
+            progress.expected.1.load(Ordering::Relaxed),
+        );
         // Work: folders to list (node id, path). Results: their contents.
         let (work_tx, work_rx) = flume::unbounded::<(u32, PathBuf)>();
         let (done_tx, done_rx) = flume::unbounded::<(u32, Vec<Entry>)>();
@@ -521,19 +581,23 @@ impl Index {
                 }
             }
         }
+        // Set once the index reaches `rules.max_items`: queued folders are no longer listed.
+        let full = AtomicBool::new(false);
         std::thread::scope(|scope| {
             for _ in 0..threads.max(1) {
                 let work_rx = work_rx.clone();
                 let done_tx = done_tx.clone();
+                let full = &full;
                 scope.spawn(move || {
                     thread_init();
                     while let Ok((id, path)) = work_rx.recv() {
-                        let entries: Vec<Entry> = if cancel.load(Ordering::Relaxed) {
-                            Vec::new()
-                        } else {
-                            fs.read_dir(&path)
-                                .map_or_default(|iter| iter.filter_map(Result::ok).collect())
-                        };
+                        let entries: Vec<Entry> =
+                            if cancel.load(Ordering::Relaxed) || full.load(Ordering::Relaxed) {
+                                Vec::new()
+                            } else {
+                                fs.read_dir(&path)
+                                    .map_or_default(|iter| iter.filter_map(Result::ok).collect())
+                            };
                         if done_tx.send((id, entries)).is_err() {
                             return;
                         }
@@ -548,6 +612,19 @@ impl Index {
                     break;
                 };
                 pending -= 1;
+                if full.load(Ordering::Relaxed) {
+                    // Past the limit: only drain what was already queued.
+                    continue;
+                }
+                if rules.max_items.is_some_and(|max| index.len() >= max) {
+                    full.store(true, Ordering::Relaxed);
+                    log::warn!(
+                        "global search: {} has more than {} items, indexing stops there",
+                        roots_label(roots),
+                        index.len()
+                    );
+                    continue;
+                }
                 progress.scanned.fetch_add(entries.len(), Ordering::Relaxed);
                 let parent_path = index.path_of(parent);
                 index.add_entries(parent, Some(&parent_path), &entries, rules, |id, entry| {
@@ -562,12 +639,32 @@ impl Index {
             drop(work_tx);
         });
         index.dedup = None;
-        index.names.shrink_to_fit();
-        index.nodes.shrink_to_fit();
-        index.sizes.shrink_to_fit();
-        index.mtimes.shrink_to_fit();
-        index.masks.shrink_to_fit();
+        // Not shrunk here: it's usually saved and mapped right away, and shrinking copies every
+        // column while the old one is still allocated (see [`Index::shrink_to_fit`]).
         index
+    }
+
+    /// Sets aside memory for `items` items with `name_bytes` of names (a little over, so a
+    /// rebuild that found a few more doesn't double everything), and starts the name dedup.
+    fn reserve(&mut self, items: usize, name_bytes: usize) {
+        let (items, name_bytes) = (items + items / 16, name_bytes + name_bytes / 16);
+        self.nodes.owned().reserve_exact(items);
+        self.sizes.owned().reserve_exact(items);
+        self.mtimes.owned().reserve_exact(items);
+        self.masks.owned().reserve_exact(items);
+        self.names.reserve_exact(name_bytes);
+        // About a third of the names on a disk are distinct.
+        self.dedup = Some(hashbrown::HashTable::with_capacity(items / 3));
+    }
+
+    /// Gives back the memory a build or merge set aside beyond what it used. Only for an index
+    /// kept in memory (not saved): copying every column briefly needs both copies.
+    pub fn shrink_to_fit(&mut self) {
+        self.names.shrink_to_fit();
+        self.nodes.shrink_to_fit();
+        self.sizes.shrink_to_fit();
+        self.mtimes.shrink_to_fit();
+        self.masks.shrink_to_fit();
     }
 
     /// Adds one folder's contents. Subfolders go through `descend` (true means it will be entered).
@@ -694,9 +791,9 @@ impl Index {
         self.mtimes.owned().truncate(nodes);
         self.masks.owned().truncate(nodes);
         self.names.truncate(names);
-        // Dedup entries pointing into the removed names are no longer valid.
-        if let Some(map) = self.dedup.as_mut() {
-            map.retain(|_, &mut (start, len)| start as usize + len as usize <= names);
+        // Dedup entries for the removed nodes are no longer valid.
+        if let Some(dedup) = self.dedup.as_mut() {
+            dedup.retain(|id| (*id as usize) < nodes);
         }
     }
 
@@ -732,6 +829,105 @@ impl Index {
         }
         let node = self.nodes.get(cur as usize)?;
         (depth == rel.len() && node.flags & (FLAG_PRUNED | FLAG_LINK) == 0).then_some(cur)
+    }
+
+    /// What the index holds directly inside each folder of `dirs`: (name, is a folder) per entry,
+    /// for the folders the index has with their contents (others are left out). One pass over the
+    /// index for all of them, so a batch of changed folders costs one pass.
+    ///
+    /// Relies on parents being added before their children, which both build paths do.
+    pub fn children_of(
+        &self,
+        dirs: &[PathBuf],
+        cancel: &AtomicBool,
+    ) -> Vec<(PathBuf, Vec<(String, bool)>)> {
+        #[derive(Default)]
+        struct Step {
+            next: HashMap<String, usize>,
+            /// Index into `dirs` when this step is one of them.
+            target: Option<usize>,
+        }
+        // The folders as paths of lowercase names under their root's step.
+        let mut steps: Vec<Step> = Vec::new();
+        let mut root_steps: Vec<(String, usize)> = Vec::new();
+        for (target, dir) in dirs.iter().enumerate() {
+            let Some((root, rel)) = self
+                .roots
+                .iter()
+                .find_map(|r| rel_components(dir, r).map(|rel| (r, rel)))
+            else {
+                continue;
+            };
+            let root_name = root.to_string_lossy().into_owned();
+            let mut cur = if let Some(&(_, step)) = root_steps.iter().find(|(n, _)| *n == root_name)
+            {
+                step
+            } else {
+                steps.push(Step::default());
+                root_steps.push((root_name, steps.len() - 1));
+                steps.len() - 1
+            };
+            for part in rel {
+                let key = part.to_lowercase();
+                cur = if let Some(&next) = steps[cur].next.get(&key) {
+                    next
+                } else {
+                    steps.push(Step::default());
+                    let next = steps.len() - 1;
+                    steps[cur].next.insert(key, next);
+                    next
+                };
+            }
+            steps[cur].target = Some(target);
+        }
+        if steps.is_empty() {
+            return Vec::new();
+        }
+        let mut found: Vec<Option<Vec<(String, bool)>>> = vec![None; dirs.len()];
+        // Nodes on the way to a folder: a bit per node id for the cheap "no" (almost every node),
+        // their steps in id order for the rest.
+        let mut on_bits = vec![0u64; self.nodes.len().div_ceil(64)];
+        let mut on: Vec<(u32, usize)> = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if i % (64 * 1024) == 0 && cancel.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            let name = self.name(node);
+            let step = if node.parent == NO_PARENT {
+                root_steps.iter().find(|(n, _)| n == name).map(|&(_, s)| s)
+            } else {
+                let p = node.parent as usize;
+                if on_bits.get(p / 64).is_none_or(|w| w & (1 << (p % 64)) == 0) {
+                    continue;
+                }
+                let Ok(at) = on.binary_search_by_key(&node.parent, |&(id, _)| id) else {
+                    continue;
+                };
+                let parent_step = on[at].1;
+                if let Some(target) = steps[parent_step].target
+                    && let Some(list) = found[target].as_mut()
+                {
+                    list.push((name.to_owned(), node.flags & FLAG_DIR != 0));
+                }
+                steps[parent_step].next.get(&name.to_lowercase()).copied()
+            };
+            let Some(step) = step else {
+                continue;
+            };
+            if let Some(target) = steps[step].target
+                && node.flags & FLAG_DIR != 0
+                && node.flags & (FLAG_PRUNED | FLAG_LINK) == 0
+            {
+                found[target] = Some(Vec::new());
+            }
+            on_bits[i / 64] |= 1 << (i % 64);
+            on.push((u32::try_from(i).unwrap_or(u32::MAX), step));
+        }
+        dirs.iter()
+            .cloned()
+            .zip(found)
+            .filter_map(|(dir, children)| children.map(|c| (dir, c)))
+            .collect()
     }
 
     /// Sizes of the subfolders of `dir`, summed from the index with `overlay` applied (see the
@@ -817,6 +1013,169 @@ impl Index {
         Some(out)
     }
 
+    /// A new index with `overlay` folded in, without walking or reading the MFT again: removed
+    /// paths are dropped with everything below them, changed ones get their new size and time,
+    /// and added ones are appended under their folder (parents stay before children). Paths
+    /// whose folder isn't in the index come back in [`Merged::unplaced`] (keep them in the
+    /// overlay). `None` if cancelled.
+    ///
+    /// The result keeps the walk time plus one second: it stays as stale as the walk for volumes
+    /// that miss changes while Arke is closed, yet sorts after the index it came from, so the
+    /// newer file is loaded and old checkpoints don't apply to it.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass over the index, then one over the adds"
+    )]
+    pub fn merged(
+        &self,
+        overlay: &Overlay,
+        rules: &BuildRules,
+        cancel: &AtomicBool,
+    ) -> Option<Merged> {
+        let tries: Vec<MergeTrie> = self
+            .roots
+            .iter()
+            .map(|r| MergeTrie::new(r, overlay))
+            .collect();
+        let added = overlay.added.len();
+        let mut out = Self {
+            roots: self.roots.clone(),
+            built_at: self.built_at + 1,
+            cursors: self.cursors.clone(),
+            skipped_build_dirs: self.skipped_build_dirs,
+            excluded_hash: self.excluded_hash,
+            names: Names::Owned(String::with_capacity(self.names.len() + added * 16)),
+            ..Self::default()
+        };
+        out.names.push_str(&self.names);
+        out.nodes.owned().reserve(self.nodes.len() + added);
+        out.sizes.owned().reserve(self.nodes.len() + added);
+        out.mtimes.owned().reserve(self.nodes.len() + added);
+        out.masks.owned().reserve(self.nodes.len() + added);
+        // Old id -> new id (NO_PARENT: dropped).
+        let mut new_id = vec![NO_PARENT; self.nodes.len()];
+        // Old ids on an overlay path -> (root, trie node).
+        let mut on_trie: HashMap<u32, (usize, usize)> = HashMap::new();
+        // Per root and trie node: the new id it got.
+        let mut placed: Vec<Vec<u32>> = tries
+            .iter()
+            .map(|t| vec![NO_PARENT; t.nodes.len()])
+            .collect();
+        // Kept items whose contents go (a folder replaced by a file).
+        let mut barren: HashSet<u32> = HashSet::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if i % (64 * 1024) == 0 && cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let id = u32::try_from(i).ok()?;
+            let name = self.name(node);
+            let (parent, here) = if node.parent == NO_PARENT {
+                let root = self
+                    .roots
+                    .iter()
+                    .position(|r| *r.to_string_lossy() == *name);
+                (NO_PARENT, root.map(|r| (r, 0)))
+            } else {
+                let parent = new_id[node.parent as usize];
+                if parent == NO_PARENT || (!barren.is_empty() && barren.contains(&node.parent)) {
+                    continue;
+                }
+                let here = on_trie
+                    .get(&node.parent)
+                    .and_then(|&(r, t)| tries[r].child(t, name).map(|c| (r, c)));
+                (parent, here)
+            };
+            let (mut flags, mut size, mut mtime) = (node.flags, self.sizes[i], self.mtimes[i]);
+            let mut name_start = node.name_start;
+            let mut name_len = node.name_len;
+            let mut mask = self.masks[i];
+            let mut drop_children = false;
+            if let Some((r, c)) = here.filter(|&(_, c)| c != 0) {
+                let t = &tries[r].nodes[c];
+                match &t.seen {
+                    None if t.removed => continue,
+                    None => {}
+                    Some(seen) => {
+                        let was_dir = flags & FLAG_DIR != 0;
+                        flags = seen_flags(seen, flags);
+                        size = seen.size;
+                        mtime = u32::try_from(seen.modified).unwrap_or(u32::MAX);
+                        drop_children = was_dir && !seen.is_dir;
+                        if t.name != name {
+                            // Renamed in letter case only.
+                            name_start = u32::try_from(out.names.len()).ok()?;
+                            name_len = u16::try_from(t.name.len()).ok()?;
+                            out.names.push_str(&t.name);
+                            mask = char_mask(&t.name);
+                        }
+                    }
+                }
+            }
+            let new = u32::try_from(out.nodes.len()).ok()?;
+            out.nodes.push(Node {
+                parent,
+                name_start,
+                name_len,
+                flags,
+            });
+            out.sizes.push(size);
+            out.mtimes.push(mtime);
+            out.masks.push(mask);
+            new_id[i] = new;
+            if drop_children {
+                barren.insert(id);
+            }
+            if let Some((r, c)) = here {
+                on_trie.insert(id, (r, c));
+                placed[r][c] = new;
+            }
+        }
+        // Added paths not in the index yet, in trie order (a folder before its contents).
+        let mut unplaced = Vec::new();
+        for (r, trie) in tries.iter().enumerate() {
+            for (c, t) in trie.nodes.iter().enumerate().skip(1) {
+                if c % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let Some(seen) = &t.seen else { continue };
+                if placed[r][c] != NO_PARENT {
+                    continue;
+                }
+                let parent = placed[r][t.parent];
+                let parent_ok = parent != NO_PARENT
+                    && out.nodes[parent as usize].flags & (FLAG_DIR | FLAG_PRUNED | FLAG_LINK)
+                        == FLAG_DIR;
+                if !parent_ok {
+                    // Under a folder that's gone: gone too. Otherwise its folder isn't indexed
+                    // (yet); it stays an overlay record.
+                    if !trie.under_removed(c) {
+                        unplaced.push(t.path.clone());
+                    }
+                    continue;
+                }
+                let mut flags = seen_flags(seen, 0);
+                let lower = t.name.to_lowercase();
+                if seen.is_dir
+                    && (SKIP_DIRS.contains(&lower.as_str())
+                        || (rules.skip_build_dirs && is_named_build_dir(&lower))
+                        || rules.excludes(&t.path))
+                {
+                    flags |= FLAG_PRUNED;
+                }
+                let mtime = u32::try_from(seen.modified).unwrap_or(u32::MAX);
+                let Some(new) = out.push(parent, &t.name, flags, seen.size, mtime) else {
+                    unplaced.push(t.path.clone());
+                    continue;
+                };
+                placed[r][c] = new;
+            }
+        }
+        Some(Merged {
+            index: out,
+            unplaced,
+        })
+    }
+
     /// Convenience query (no narrowing).
     pub fn find(
         &self,
@@ -832,6 +1191,7 @@ impl Index {
             threads,
             within: None,
             collect_matched: false,
+            cancel: None,
         })
         .hits
     }
@@ -843,6 +1203,7 @@ impl Index {
         let empty = SearchResult {
             hits: Vec::new(),
             matched: None,
+            cancelled: false,
         };
         let query = s.query;
         if query.is_empty() || self.nodes.is_empty() {
@@ -869,31 +1230,43 @@ impl Index {
         // Small chunks: faster (performance) cores naturally do more, nobody waits on the slowest
         // thread.
         let next = AtomicUsize::new(0);
-        let results: Vec<Chunk> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..threads)
-                .map(|_| {
-                    let (matching, next) = (&matching, &next);
-                    scope.spawn(move || {
-                        let mut out = Chunk::default();
-                        let mut work = Work::new();
-                        loop {
-                            let start = next.fetch_add(CHUNK, Ordering::Relaxed);
-                            if start >= total {
-                                break;
-                            }
-                            let range = start..(start + CHUNK).min(total);
-                            self.scan(s, range, matching, &mut work, &mut out);
-                        }
-                        out.top = work.top.into_iter().map(|Reverse(x)| x).collect();
-                        out
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        let cancelled = || s.cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+        let worker = || {
+            WORK.with_borrow_mut(|slot| {
+                let work = slot.get_or_insert_with(Work::new);
+                work.top.clear();
+                let mut out = Chunk::default();
+                loop {
+                    let start = next.fetch_add(CHUNK, Ordering::Relaxed);
+                    if start >= total || cancelled() {
+                        break;
+                    }
+                    let range = start..(start + CHUNK).min(total);
+                    self.scan(s, range, &matching, work, &mut out);
+                }
+                out.top = work.top.drain().map(|Reverse(x)| x).collect();
+                out
+            })
+        };
+        let results: parking_lot::Mutex<Vec<Chunk>> = parking_lot::Mutex::new(Vec::new());
+        match scan_pool() {
+            Some(pool) => pool.scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        let chunk = worker();
+                        results.lock().push(chunk);
+                    });
+                }
+            }),
+            None => results.lock().push(worker()),
+        }
+        let results = results.into_inner();
+        if cancelled() {
+            return SearchResult {
+                cancelled: true,
+                ..empty
+            };
+        }
         let mut candidates = Vec::new();
         let mut matched = s.collect_matched.then(Vec::new);
         for chunk in results {
@@ -908,7 +1281,11 @@ impl Index {
         }
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         let hits = self.finish(candidates, pattern.as_ref(), dir_part, s.limit);
-        SearchResult { hits, matched }
+        SearchResult {
+            hits,
+            matched,
+            cancelled: false,
+        }
     }
 
     /// Scans one chunk: `range` is a span of ids (positions in `within` when set).
@@ -1349,6 +1726,13 @@ impl Layout {
     }
 }
 
+/// How much a full column (or name pool) of `capacity` grows to fit `needed` more: half again,
+/// not the standard doubling. A build of millions of items would otherwise end up to twice the
+/// size it needs (a third more on average), on top of the old allocation while it's copied.
+fn grow_by(capacity: usize, needed: usize) -> usize {
+    (capacity / 2).max(needed).max(4096)
+}
+
 /// One index column: on the heap when built, mapped from the file when loaded ([`Index::open`]).
 enum Column<T: Copy + 'static> {
     Owned(Vec<T>),
@@ -1400,7 +1784,11 @@ impl<T: Copy> Column<T> {
     }
 
     fn push(&mut self, value: T) {
-        self.owned().push(value);
+        let v = self.owned();
+        if v.len() == v.capacity() {
+            v.reserve_exact(grow_by(v.capacity(), 1));
+        }
+        v.push(value);
     }
 
     fn shrink_to_fit(&mut self) {
@@ -1460,7 +1848,16 @@ impl Names {
             *self = Self::Owned(self.to_string());
         }
         if let Self::Owned(owned) = self {
+            if owned.capacity() - owned.len() < s.len() {
+                owned.reserve_exact(grow_by(owned.capacity(), s.len()));
+            }
             owned.push_str(s);
+        }
+    }
+
+    fn reserve_exact(&mut self, additional: usize) {
+        if let Self::Owned(owned) = self {
+            owned.reserve_exact(additional);
         }
     }
 
@@ -1515,8 +1912,14 @@ struct Work {
     top: BinaryHeap<Reverse<Rank>>,
 }
 
+/// Scratch spaces created so far (tests check they are reused across queries).
+#[cfg(test)]
+static WORK_CREATED: AtomicUsize = AtomicUsize::new(0);
+
 impl Work {
     fn new() -> Self {
+        #[cfg(test)]
+        WORK_CREATED.fetch_add(1, Ordering::Relaxed);
         Self {
             matcher: Matcher::new(nucleo::Config::DEFAULT.match_paths()),
             buf: Vec::new(),
@@ -1652,7 +2055,7 @@ impl Seen {
 ///
 /// Records carry a sequence number; once a rebuild finishes, records older than its start are
 /// already in the new index and can be dropped.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Overlay {
     /// Paths that exist (added or modified).
     added: HashMap<PathBuf, (Seen, u64)>,
@@ -1690,10 +2093,37 @@ impl Overlay {
         }
     }
 
+    /// Paths recorded as added directly inside `dir`.
+    #[must_use]
+    pub fn added_in(&self, dir: &Path) -> Vec<PathBuf> {
+        self.added
+            .keys()
+            .filter(|p| p.parent() == Some(dir))
+            .cloned()
+            .collect()
+    }
+
     /// Drops records before `seq` (the new index includes them).
     pub fn prune_before(&mut self, seq: u64) {
         self.added.retain(|_, (_, s)| *s > seq);
         self.removed.retain(|_, s| *s > seq);
+        self.shrink();
+    }
+
+    /// Gives back the room of pruned records: up to 100,000 of them pile up between merges,
+    /// and a map keeps its size when emptied.
+    fn shrink(&mut self) {
+        self.added.shrink_to_fit();
+        self.removed.shrink_to_fit();
+    }
+
+    /// After [`Index::merged`]: drops records up to `seq` except `keep` (the ones it couldn't
+    /// place).
+    pub fn prune_merged(&mut self, seq: u64, keep: &[PathBuf]) {
+        let keep: HashSet<&PathBuf> = keep.iter().collect();
+        self.added.retain(|p, (_, s)| *s > seq || keep.contains(p));
+        self.removed.retain(|_, s| *s > seq);
+        self.shrink();
     }
 
     /// Saves to a small file (for journal checkpoints, see index_service): added paths with their
@@ -2021,6 +2451,118 @@ impl OverlayTrie {
     }
 }
 
+/// Output of [`Index::merged`].
+pub struct Merged {
+    /// The index with the changes folded in.
+    pub index: Index,
+    /// Recorded paths whose folder isn't in the index; they stay overlay records.
+    pub unplaced: Vec<PathBuf>,
+}
+
+/// Index flags for a stat result; link and pruned marks carry over from `old`.
+const fn seen_flags(seen: &Seen, old: u8) -> u8 {
+    let mut flags = old & (FLAG_LINK | FLAG_PRUNED);
+    if seen.is_dir {
+        flags |= FLAG_DIR;
+    }
+    if seen.hidden {
+        flags |= FLAG_HIDDEN;
+    }
+    flags
+}
+
+/// Overlay paths below one root as a tree, for [`Index::merged`].
+struct MergeTrie {
+    nodes: Vec<MergeNode>,
+}
+
+#[derive(Default)]
+struct MergeNode {
+    /// Children by lowercase name.
+    children: HashMap<String, usize>,
+    parent: usize,
+    /// Name as recorded (the added path's letter case when there is one).
+    name: String,
+    /// Full path, for added records.
+    path: PathBuf,
+    /// Added or changed since the build.
+    seen: Option<Seen>,
+    /// Removed since the build.
+    removed: bool,
+}
+
+impl MergeTrie {
+    fn new(root: &Path, overlay: &Overlay) -> Self {
+        let mut trie = Self {
+            nodes: vec![MergeNode::default()],
+        };
+        let added = overlay.added.iter().map(|(p, (seen, _))| (p, Some(*seen)));
+        let removed = overlay.removed.keys().map(|p| (p, None));
+        for (path, seen) in added.chain(removed) {
+            let Some(rel) = rel_components(path, root).filter(|r| !r.is_empty()) else {
+                continue;
+            };
+            let mut cur = 0;
+            for part in rel {
+                let key = part.to_lowercase();
+                cur = if let Some(&next) = trie.nodes[cur].children.get(&key) {
+                    next
+                } else {
+                    let next = trie.nodes.len();
+                    trie.nodes.push(MergeNode {
+                        parent: cur,
+                        name: part,
+                        ..MergeNode::default()
+                    });
+                    trie.nodes[cur].children.insert(key, next);
+                    next
+                };
+            }
+            let node = &mut trie.nodes[cur];
+            match seen {
+                Some(seen) => {
+                    node.seen = Some(seen);
+                    node.path.clone_from(path);
+                    if let Some(name) = path.file_name() {
+                        node.name = name.to_string_lossy().into_owned();
+                    }
+                }
+                None => node.removed = true,
+            }
+        }
+        trie
+    }
+
+    fn child(&self, parent: usize, name: &str) -> Option<usize> {
+        let children = &self.nodes.get(parent)?.children;
+        if children.is_empty() {
+            return None;
+        }
+        children.get(&name.to_lowercase()).copied()
+    }
+
+    /// Whether a folder above node `c` was removed (and not added back).
+    fn under_removed(&self, mut c: usize) -> bool {
+        while c != 0 {
+            c = self.nodes[c].parent;
+            let node = &self.nodes[c];
+            if node.removed && node.seen.is_none() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Roots for log lines (`C:\, D:\`).
+pub fn roots_label(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Whether the walk enters this folder: only plain folders. Not symlinks/junctions (cycles or
 /// duplicates), not cloud placeholder folders (listing recalls from the cloud), not
 /// hidden+system folders or the recycle bin.
@@ -2169,6 +2711,7 @@ mod tests {
                 &BuildRules {
                     skip_build_dirs: true,
                     excluded: vec![PathBuf::from(r"c:\users\me\proj\SRC")],
+                    max_items: None,
                 },
                 list,
             )
@@ -2213,6 +2756,84 @@ mod tests {
         assert_eq!(all_paths(&index), [r"C:\", r"D:\", r"D:\walked.txt"]);
         // The name pool shrank too, so dedup never points into the removed span.
         assert_eq!(&*index.names, r"C:\D:\walked.txt");
+    }
+
+    /// A NAS share's snapshots are each a full copy of the share: walking them never ends on a
+    /// share with many snapshots. They, the NAS recycle bin and thumbnail folders aren't entered.
+    #[test]
+    fn skips_nas_snapshots_recycle_bins_and_thumbnails() {
+        let fs = FakeFs::new();
+        fs.insert_dir(
+            r"\\nas\share",
+            vec![
+                dir("docs"),
+                dir("#snapshot"),
+                dir("#recycle"),
+                dir("@eaDir"),
+            ],
+        );
+        fs.insert_dir(r"\\nas\share\docs", vec![file("plan.xlsx")]);
+        fs.insert_dir(r"\\nas\share\#snapshot", vec![dir("GMT+08-2026.11.16")]);
+        fs.insert_dir(
+            r"\\nas\share\#snapshot\GMT+08-2026.11.16",
+            vec![file("plan.xlsx")],
+        );
+        fs.insert_dir(r"\\nas\share\#recycle", vec![file("old-plan.xlsx")]);
+        fs.insert_dir(r"\\nas\share\@eaDir", vec![file("plan.xlsx@SynoEAStream")]);
+        let index = Index::build(
+            fs.as_ref(),
+            &[PathBuf::from(r"\\nas\share")],
+            1,
+            &AtomicBool::new(false),
+            &BuildProgress::default(),
+            &|| {},
+            false,
+        );
+        assert_eq!(
+            all_paths(&index),
+            [
+                r"\\nas\share",
+                r"\\nas\share\#recycle",
+                r"\\nas\share\#snapshot",
+                r"\\nas\share\@eaDir",
+                r"\\nas\share\docs",
+                r"\\nas\share\docs\plan.xlsx",
+            ]
+        );
+    }
+
+    /// With a limit, the walk stops entering folders once the index is that big, so a huge share
+    /// can't keep growing the index for hours.
+    #[test]
+    fn stops_walking_at_the_item_limit() {
+        let fs = FakeFs::new();
+        let folders: Vec<Entry> = (0..20).map(|i| dir(&format!("d{i:02}"))).collect();
+        fs.insert_dir(r"\\nas\big", folders);
+        for i in 0..20 {
+            fs.insert_dir(
+                format!(r"\\nas\big\d{i:02}"),
+                (0..10).map(|j| file(&format!("f{j}.txt"))).collect(),
+            );
+        }
+        let build = |max_items| {
+            Index::build_listed(
+                fs.as_ref(),
+                &[PathBuf::from(r"\\nas\big")],
+                1,
+                &AtomicBool::new(false),
+                &BuildProgress::default(),
+                &|| {},
+                &BuildRules {
+                    max_items,
+                    ..BuildRules::default()
+                },
+                &|_, _| Err(io::ErrorKind::Unsupported.into()),
+            )
+        };
+        assert_eq!(build(None).len(), 1 + 20 + 200);
+        let capped = build(Some(50)).len();
+        // One folder's contents may land after the limit is reached, nothing more.
+        assert!((50..=50 + 10).contains(&capped), "{capped} items");
     }
 
     #[test]
@@ -2345,6 +2966,84 @@ mod tests {
         let mut hits = paths(&find(&index, "index.js", 10, false));
         hits.sort();
         assert_eq!(hits, [r"C:\a\index.js", r"C:\b\index.js"]);
+    }
+
+    /// Records folded into the index are dropped with the room they took.
+    #[test]
+    fn a_pruned_overlay_gives_its_room_back() {
+        let mut overlay = Overlay::default();
+        let seen = Seen {
+            is_dir: false,
+            hidden: false,
+            size: 1,
+            modified: 0,
+        };
+        for i in 0..20_000 {
+            overlay.record(PathBuf::from(format!(r"C:\build\out{i}.o")), Some(seen));
+            overlay.record(PathBuf::from(format!(r"C:\old\gone{i}.o")), None);
+        }
+        let seq = overlay.seq();
+        overlay.record(PathBuf::from(r"C:\later.txt"), Some(seen));
+        overlay.prune_merged(seq, &[]);
+        assert_eq!(overlay.len(), 1);
+        assert!(
+            overlay.added.capacity() < 100 && overlay.removed.capacity() < 100,
+            "{} / {}",
+            overlay.added.capacity(),
+            overlay.removed.capacity()
+        );
+    }
+
+    /// A build grows its columns by half, not double; a rebuild sets aside about what the index
+    /// it replaces used and never grows. Only an index kept in memory is shrunk.
+    #[test]
+    fn builds_set_aside_little_more_than_they_use() {
+        let fs = FakeFs::new();
+        let folders: Vec<_> = (0..40).map(|i| dir(&format!("folder {i}"))).collect();
+        fs.insert_dir(r"C:\", folders);
+        for i in 0..40 {
+            let files: Vec<_> = (0..500).map(|j| file(&format!("f{i}-{j}.txt"))).collect();
+            fs.insert_dir(format!(r"C:\folder {i}"), files);
+        }
+        let build = |progress: &BuildProgress| {
+            Index::build(
+                fs.as_ref(),
+                &[PathBuf::from(r"C:\")],
+                2,
+                &AtomicBool::new(false),
+                progress,
+                &|| {},
+                false,
+            )
+        };
+        let first = build(&BuildProgress::default());
+        let items = first.len();
+        assert_eq!(items, 1 + 40 + 40 * 500);
+        let capacity = first.nodes.heap_capacity();
+        assert!(
+            capacity >= items && capacity <= items + items / 2 + 4096,
+            "{capacity} for {items}"
+        );
+
+        let progress = BuildProgress::default();
+        progress.expected.0.store(items, Ordering::Relaxed);
+        progress
+            .expected
+            .1
+            .store(first.name_bytes(), Ordering::Relaxed);
+        let mut again = build(&progress);
+        assert_eq!(again.len(), items);
+        assert_eq!(again.nodes.heap_capacity(), items + items / 16);
+        let names = first.name_bytes();
+        assert_eq!(again.names.heap_capacity(), names + names / 16);
+
+        again.shrink_to_fit();
+        assert_eq!(again.nodes.heap_capacity(), items);
+        assert_eq!(again.names.heap_capacity(), names);
+        assert_eq!(
+            paths(&find(&again, "f39-499", 10, false)),
+            [r"C:\folder 39\f39-499.txt"]
+        );
     }
 
     #[test]
@@ -2574,6 +3273,7 @@ mod tests {
                 threads: 2,
                 within,
                 collect_matched: true,
+                cancel: None,
             })
         };
         let first = search("rep", None);
@@ -2602,6 +3302,170 @@ mod tests {
         );
         // Only the root itself.
         assert_eq!(index.len(), 1);
+    }
+
+    /// Folding the overlay into the index gives what a fresh walk would: new files and moved-in
+    /// folders appear, deleted files and folders (and everything below) go, changed files get
+    /// their new size, a case-only rename takes the new name. Records whose folder isn't indexed
+    /// stay in the overlay.
+    #[test]
+    fn merging_the_overlay_matches_a_fresh_walk() {
+        let fs = FakeFs::new();
+        fs.insert_dir(
+            r"C:\docs",
+            vec![file("a.txt"), file("b.txt"), file("Case.md")],
+        );
+        fs.insert_dir(r"C:\old\deep", vec![file("y.txt")]);
+        fs.add_file(Path::new(r"C:\old"), "x.txt", 1);
+        fs.insert_dir(r"C:\proj\node_modules", vec![file("lib.js")]);
+        let walk = |fs: &FakeFs| {
+            Index::build(
+                fs,
+                &[PathBuf::from(r"C:\")],
+                2,
+                &AtomicBool::new(false),
+                &BuildProgress::default(),
+                &|| {},
+                true,
+            )
+        };
+        let base = walk(&fs);
+        let mut overlay = Overlay::default();
+        let mut record = |path: &str, fs: &FakeFs| {
+            let path = PathBuf::from(path);
+            let seen = fs.stat(&path).ok().map(|e| Seen::of(&e));
+            overlay.record(path, seen);
+        };
+        // A file inside a folder recorded before the folder was deleted: gone with it.
+        record(r"C:\old\deep\y.txt", &fs);
+        fs.remove(Path::new(r"C:\"), "old");
+        record(r"C:\old", &fs);
+        fs.add_file(Path::new(r"C:\docs"), "c.txt", 7);
+        record(r"C:\docs\c.txt", &fs);
+        fs.remove(Path::new(r"C:\docs"), "a.txt");
+        record(r"C:\docs\a.txt", &fs);
+        fs.add_file(Path::new(r"C:\docs"), "b.txt", 99);
+        record(r"C:\docs\b.txt", &fs);
+        fs.remove(Path::new(r"C:\docs"), "Case.md");
+        fs.add_file(Path::new(r"C:\docs"), "case.md", 1);
+        record(r"C:\docs\Case.md", &fs);
+        record(r"C:\docs\case.md", &fs);
+        // Moved in: the folder and its contents (as record_tree does), deepest last.
+        fs.insert_dir(r"C:\moved\sub", vec![file("deep-report.txt")]);
+        fs.add_file(Path::new(r"C:\moved"), "report.txt", 3);
+        for p in [
+            r"C:\moved",
+            r"C:\moved\report.txt",
+            r"C:\moved\sub",
+            r"C:\moved\sub\deep-report.txt",
+        ] {
+            record(p, &fs);
+        }
+        // Inside a folder the index skips: can't be placed.
+        fs.add_file(Path::new(r"C:\proj\node_modules"), "new.js", 1);
+        record(r"C:\proj\node_modules\new.js", &fs);
+
+        let merged = base
+            .merged(
+                &overlay,
+                &BuildRules {
+                    skip_build_dirs: true,
+                    ..BuildRules::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            merged.unplaced,
+            [PathBuf::from(r"C:\proj\node_modules\new.js")]
+        );
+        let fresh = walk(&fs);
+        assert_eq!(all_paths(&merged.index), all_paths(&fresh));
+        let sizes = |index: &Index| {
+            let mut v: Vec<(String, u64)> = (0..index.len())
+                .map(|i| {
+                    (
+                        index.path_of(i as u32).display().to_string(),
+                        index.sizes[i],
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sizes(&merged.index), sizes(&fresh));
+        assert!(merged.index.built_at > base.built_at, "sorts as newer");
+        // Still searchable, and parents still come before children (folder sizes rely on it).
+        assert_eq!(
+            paths(&find(&merged.index, "deep-report", 5, false)),
+            [r"C:\moved\sub\deep-report.txt"]
+        );
+        for (i, node) in merged.index.nodes.iter().enumerate() {
+            assert!(node.parent == NO_PARENT || (node.parent as usize) < i);
+        }
+        // Round trip through the saved format.
+        let mut bytes = Vec::new();
+        merged.index.write_to(&mut bytes).unwrap();
+        let back = Index::read_from(&mut bytes.as_slice()).unwrap();
+        assert_eq!(all_paths(&back), all_paths(&fresh));
+        // Records it couldn't place stay; the rest go.
+        overlay.prune_merged(overlay.seq(), &merged.unplaced);
+        assert_eq!(overlay.len(), 1);
+    }
+
+    /// An index of `n` files under one folder.
+    fn flat(n: u32) -> Index {
+        let mut index = Index {
+            roots: vec![PathBuf::from(r"C:\")],
+            ..Index::default()
+        };
+        let root = index.push(NO_PARENT, r"C:\", FLAG_DIR, 0, 0).unwrap();
+        for i in 0..n {
+            index.push(root, &format!("report_{i:07}.txt"), 0, 1, 0);
+        }
+        index
+    }
+
+    /// Typing on: the caller cancels the previous query, which stops scanning and reports so
+    /// (no partial results that look complete, nothing kept for narrowing).
+    #[test]
+    fn cancelled_queries_stop_scanning() {
+        let index = flat(200_000);
+        let query = q("rprt");
+        let search = |cancel: &AtomicBool| {
+            index.search(&Search {
+                query: &query,
+                limit: 50,
+                show_hidden: false,
+                threads: 4,
+                within: None,
+                collect_matched: true,
+                cancel: Some(cancel),
+            })
+        };
+        let done = search(&AtomicBool::new(false));
+        assert!(!done.cancelled);
+        assert_eq!(done.hits.len(), 50);
+        assert_eq!(done.matched.map(|m| m.len()), Some(200_000));
+        let gave_up = search(&AtomicBool::new(true));
+        assert!(gave_up.cancelled);
+        assert!(gave_up.hits.is_empty() && gave_up.matched.is_none());
+    }
+
+    /// Queries run on threads kept between them, each reusing its scratch space, instead of a
+    /// fresh thread (and matcher) per core for every keystroke.
+    #[test]
+    fn queries_reuse_scan_threads() {
+        let index = flat(100_000);
+        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        for text in ["r", "re", "rep", "repo", "repor", "report"].repeat(5) {
+            assert!(!index.find(&q(text), 10, false, cpus).is_empty(), "{text}");
+        }
+        let created = WORK_CREATED.load(Ordering::Relaxed);
+        assert!(
+            created <= cpus,
+            "30 queries on {cpus} threads made {created} scratch spaces"
+        );
     }
 
     fn sized(name: &str, size: u64) -> Entry {
@@ -2901,14 +3765,280 @@ mod tests {
             index.push(root + i / 1000, &name, 0, u64::from(i), 1_700_000_000 + i);
         }
         let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        for text in ["rprt", "季報", "main_00012", "zzzz", "ext:rs size:>1000000"] {
-            let t = std::time::Instant::now();
-            let hits = index.find(&q(text), 50, false, threads);
+        // Median of many runs: one keystroke is one query, so this is the per-keystroke latency.
+        let median = |text: &str| {
+            let query = q(text);
+            let mut times: Vec<Duration> = (0..41)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(index.find(&query, 50, false, threads));
+                    t.elapsed()
+                })
+                .collect();
+            times.sort_unstable();
+            times[times.len() / 2]
+        };
+        for text in [
+            "r",
+            "rp",
+            "rprt",
+            "季報",
+            "main_00012",
+            "zzzz",
+            "ext:rs size:>1000000",
+        ] {
+            let hits = index.find(&q(text), 50, false, threads).len();
             println!(
-                "{text}: {} hits, {:?} ({threads} threads, {} items)",
-                hits.len(),
-                t.elapsed(),
+                "{text:>22}: {hits:>2} hits, median {:>9.2?} ({threads} threads, {} items)",
+                median(text),
                 index.len()
+            );
+        }
+        // A small index, where getting the scan going weighs the most.
+        let small = Index {
+            nodes: Column::Owned(index.nodes[..40_000].to_vec()),
+            sizes: Column::Owned(index.sizes[..40_000].to_vec()),
+            mtimes: Column::Owned(index.mtimes[..40_000].to_vec()),
+            masks: Column::Owned(index.masks[..40_000].to_vec()),
+            names: Names::Owned(index.names.to_string()),
+            roots: index.roots.clone(),
+            ..Index::default()
+        };
+        let zzzz = q("zzzz");
+        let mut times: Vec<Duration> = (0..201)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(small.find(&zzzz, 50, false, threads));
+                t.elapsed()
+            })
+            .collect();
+        times.sort_unstable();
+        println!(
+            "{:>22}: median {:>9.2?} ({} items)",
+            "zzzz (small)",
+            times[times.len() / 2],
+            small.len()
+        );
+    }
+
+    /// The contents of several folders in one pass: names in any letter case find the folder,
+    /// nested folders and the root work, and folders the index lacks (or holds only as a file or
+    /// a link) are left out.
+    #[test]
+    fn children_of_finds_each_folder_once() {
+        let mut index = Index {
+            roots: vec![PathBuf::from(r"C:\")],
+            ..Index::default()
+        };
+        let root = index.push(NO_PARENT, r"C:\", FLAG_DIR, 0, 0).unwrap();
+        let users = index.push(root, "Users", FLAG_DIR, 0, 0).unwrap();
+        let build = index.push(users, "build", FLAG_DIR, 0, 0).unwrap();
+        index.push(build, "a.txt", 0, 1, 0).unwrap();
+        let sub = index.push(build, "Sub", FLAG_DIR, 0, 0).unwrap();
+        index.push(sub, "b.txt", 0, 1, 0).unwrap();
+        index.push(users, "notes.txt", 0, 1, 0).unwrap();
+        index
+            .push(users, "link", FLAG_DIR | FLAG_LINK, 0, 0)
+            .unwrap();
+        let dirs = [
+            PathBuf::from(r"C:\users\BUILD"),
+            PathBuf::from(r"C:\Users\build\sub"),
+            PathBuf::from(r"C:\"),
+            PathBuf::from(r"C:\Users\missing"),
+            PathBuf::from(r"C:\Users\notes.txt"),
+            PathBuf::from(r"C:\Users\link"),
+            PathBuf::from(r"D:\elsewhere"),
+        ];
+        let got = index.children_of(&dirs, &AtomicBool::new(false));
+        let names = |d: &str| -> Option<Vec<(String, bool)>> {
+            got.iter()
+                .find(|(p, _)| p == Path::new(d))
+                .map(|(_, c)| c.clone())
+        };
+        assert_eq!(
+            names(r"C:\users\BUILD"),
+            Some(vec![("a.txt".to_owned(), false), ("Sub".to_owned(), true)])
+        );
+        assert_eq!(
+            names(r"C:\Users\build\sub"),
+            Some(vec![("b.txt".to_owned(), false)])
+        );
+        assert_eq!(names(r"C:\"), Some(vec![("Users".to_owned(), true)]));
+        assert_eq!(got.len(), 3, "{got:?}");
+    }
+
+    /// Comparing the folders of one batch of changes with a 4M-item index: one pass for all of them
+    /// (`cargo test --release -p arke-core -- --ignored --nocapture children_of_speed`).
+    #[test]
+    #[ignore = "benchmark; run manually"]
+    #[allow(
+        clippy::print_stdout,
+        reason = "a benchmark run by hand prints its timings"
+    )]
+    fn children_of_speed() {
+        let mut index = Index {
+            roots: vec![PathBuf::from(r"C:\")],
+            ..Index::default()
+        };
+        let root = index.push(NO_PARENT, r"C:\", FLAG_DIR, 0, 0).unwrap();
+        let mut dirs = Vec::new();
+        for d in 0..4000u32 {
+            dirs.push(
+                index
+                    .push(root, &format!("dir{d:04}"), FLAG_DIR, 0, 0)
+                    .unwrap(),
+            );
+        }
+        for i in 0..4_000_000u32 {
+            index.push(
+                dirs[(i % 4000) as usize],
+                &format!("file_{i:07}.txt"),
+                0,
+                1,
+                0,
+            );
+        }
+        for count in [1usize, 100, 2000] {
+            let wanted: Vec<PathBuf> = (0..count)
+                .map(|d| PathBuf::from(format!(r"C:\dir{:04}", d * 2 % 4000)))
+                .collect();
+            let t = std::time::Instant::now();
+            let got = index.children_of(&wanted, &AtomicBool::new(false));
+            println!(
+                "children_of {count} folders in {} items: {:?} ({} children)",
+                index.len(),
+                t.elapsed(),
+                got.iter().map(|(_, c)| c.len()).sum::<usize>()
+            );
+        }
+    }
+
+    /// Folding 100k changes into a 4M-item index, what replaces a full rebuild when the overlay
+    /// fills up (`cargo test --release -p arke-core -- --ignored --nocapture merge_speed`).
+    #[test]
+    #[ignore = "benchmark; run manually"]
+    #[allow(
+        clippy::print_stdout,
+        reason = "a benchmark run by hand prints its timings"
+    )]
+    fn merge_speed() {
+        let mut index = Index {
+            roots: vec![PathBuf::from(r"C:\")],
+            ..Index::default()
+        };
+        let root = index.push(NO_PARENT, r"C:\", FLAG_DIR, 0, 0).unwrap();
+        let mut dirs = Vec::new();
+        for d in 0..4000u32 {
+            dirs.push(
+                index
+                    .push(root, &format!("dir{d:04}"), FLAG_DIR, 0, 0)
+                    .unwrap(),
+            );
+        }
+        for i in 0..4_000_000u32 {
+            index.push(
+                dirs[(i % 4000) as usize],
+                &format!("file_{i:07}.txt"),
+                0,
+                1,
+                0,
+            );
+        }
+        let mut overlay = Overlay::default();
+        let seen = Seen {
+            is_dir: false,
+            hidden: false,
+            size: 7,
+            modified: 0,
+        };
+        for i in 0..100_000u32 {
+            let path = PathBuf::from(format!(r"C:\dir{:04}\file_{i:07}.txt", i % 4000));
+            // Half changed in place, a quarter deleted, a quarter new.
+            let seen = match i % 4 {
+                0 | 1 => Some(seen),
+                2 => None,
+                _ => {
+                    overlay.record(
+                        PathBuf::from(format!(r"C:\dir{:04}\new_{i:07}.txt", i % 4000)),
+                        Some(seen),
+                    );
+                    continue;
+                }
+            };
+            overlay.record(path, seen);
+        }
+        let t = std::time::Instant::now();
+        let merged = index
+            .merged(&overlay, &BuildRules::default(), &AtomicBool::new(false))
+            .unwrap();
+        println!(
+            "merged {} changes into {} items: {:?} ({} items after, {} unplaced)",
+            overlay.len(),
+            index.len(),
+            t.elapsed(),
+            merged.index.len(),
+            merged.unplaced.len()
+        );
+    }
+
+    /// Fast typing: four queries 2 ms apart, each on its own thread like the app's. Latency of
+    /// the last one, with the earlier ones left running or cancelled (`cargo test --release -p
+    /// arke-core -- --ignored --nocapture typing_burst_speed`).
+    #[test]
+    #[ignore = "benchmark; run manually"]
+    #[allow(
+        clippy::print_stdout,
+        reason = "a benchmark run by hand prints its timings"
+    )]
+    fn typing_burst_speed() {
+        let mut index = Index {
+            roots: vec![PathBuf::from(r"C:\")],
+            ..Index::default()
+        };
+        let root = index.push(NO_PARENT, r"C:\", FLAG_DIR, 0, 0).unwrap();
+        for i in 0..2_000_000u32 {
+            let name = format!("{}_{i:07}.txt", ["report", "photo", "main"][i as usize % 3]);
+            index.push(root + i / 1000, &name, 0, u64::from(i), 0);
+        }
+        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let texts = ["r", "rp", "rpr", "rprt"].map(q);
+        for cancel in [false, true] {
+            let mut last: Vec<Duration> = (0..21)
+                .map(|_| {
+                    let flags: Vec<AtomicBool> =
+                        texts.iter().map(|_| AtomicBool::new(false)).collect();
+                    std::thread::scope(|scope| {
+                        let mut handles = Vec::new();
+                        for (k, query) in texts.iter().enumerate() {
+                            if cancel && k > 0 {
+                                flags[k - 1].store(true, Ordering::Relaxed);
+                            }
+                            let flag = &flags[k];
+                            let index = &index;
+                            let started = std::time::Instant::now();
+                            handles.push(scope.spawn(move || {
+                                index.search(&Search {
+                                    query,
+                                    limit: 50,
+                                    show_hidden: false,
+                                    threads,
+                                    within: None,
+                                    collect_matched: false,
+                                    cancel: Some(flag),
+                                });
+                                started.elapsed()
+                            }));
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        handles.pop().unwrap().join().unwrap()
+                    })
+                })
+                .collect();
+            last.sort_unstable();
+            println!(
+                "typing burst, earlier queries {}: last query median {:>9.2?}",
+                if cancel { "cancelled" } else { "left running" },
+                last[last.len() / 2]
             );
         }
     }
@@ -3102,6 +4232,7 @@ mod tests {
                 threads: cpus,
                 within: within.as_deref(),
                 collect_matched: narrowable,
+                cancel: None,
             });
             println!(
                 "{text:>24}: {:>8.2?}  narrowed to {}",

@@ -175,7 +175,8 @@ pub(crate) enum StartLocation {
     Home,
     /// The last folder visited.
     LastFolder,
-    /// All tabs from last time, including splits. If a window is already open, new windows use the profile folder.
+    /// All tabs from last time, including splits. If a window is already open, new windows open
+    /// Home.
     LastSession,
     /// Home page (recent files, drives, network locations).
     HomePage,
@@ -332,6 +333,18 @@ impl ColumnWidths {
     }
 }
 
+/// Column view widths the user dragged or fitted, in pixels (`None`: the default). One set for
+/// every folder, so the columns don't jump while browsing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ColumnViewWidths {
+    /// The parent folder's column.
+    pub(crate) parent: Option<u16>,
+    /// The current folder's column; the preview takes the rest. `None`: it fills what the
+    /// preview leaves.
+    pub(crate) current: Option<u16>,
+}
+
 /// Where folders sort.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -434,6 +447,9 @@ pub(crate) struct Settings {
     pub(crate) details_size: DetailsSize,
     /// Preview pane on the right.
     pub(crate) preview_pane: bool,
+    /// Space hands the item to QuickLook (QL-Win) instead of Arke's Quick Look (offered only
+    /// when it is installed).
+    pub(crate) space_quicklook: bool,
     /// Ctrl+T searches the whole PC. Needs an index, off by default.
     pub(crate) global_search: bool,
     /// Global search skips build and package cache folders (`node_modules`, Rust `target`, ...).
@@ -459,6 +475,10 @@ pub(crate) struct Settings {
     pub(crate) theme: ThemeMode,
     /// Background of the dark theme.
     pub(crate) dark_shade: DarkShade,
+    /// The sidebar is collapsed to a column of icons (Ctrl+B).
+    pub(crate) sidebar_collapsed: bool,
+    /// The collapsed sidebar opens over the content while the pointer rests on it (#122).
+    pub(crate) sidebar_peek: bool,
     pub(crate) accent: Accent,
     pub(crate) tint: Tint,
     pub(crate) material: Material,
@@ -555,6 +575,8 @@ pub(crate) struct Settings {
     pub(crate) preview_width: Option<u16>,
     /// Width the sidebar was dragged to, app-wide (`None`: the default width).
     pub(crate) sidebar_width: Option<u16>,
+    /// Column view: the parent and current folder columns' widths.
+    pub(crate) column_view_widths: ColumnViewWidths,
     pub(crate) show_type: bool,
     pub(crate) show_size: bool,
     /// Extension, Attributes (R/H/S/A) and Link target columns, hidden by default.
@@ -573,6 +595,9 @@ pub(crate) struct Settings {
     pub(crate) menu_hidden: Vec<String>,
     /// Windows commands pinned to the main menu from "More options" (`explorer_menu::pin_key` keys, in pin order).
     pub(crate) menu_pinned: Vec<String>,
+    /// Which extension (COM class) each pinned command comes from, learned from the menus seen;
+    /// empty when none has it. Lets a pinned command show before the whole Windows menu is read.
+    pub(crate) menu_pin_owners: std::collections::BTreeMap<String, String>,
     /// Auto update: channel (`None` follows this build's channel), whether to check automatically,
     /// and the last check time (Unix seconds).
     pub(crate) update_channel_choice: Option<crate::build_info::Channel>,
@@ -612,6 +637,7 @@ impl Default for Settings {
             density: Density::default(),
             details_size: DetailsSize::default(),
             preview_pane: false,
+            space_quicklook: false,
             global_search: false,
             search_network: Vec::new(),
             search_network_auto: true,
@@ -627,6 +653,8 @@ impl Default for Settings {
             tint: Tint::default(),
             material: Material::default(),
             dark_shade: DarkShade::default(),
+            sidebar_collapsed: false,
+            sidebar_peek: true,
             font: String::new(),
             background_image: None,
             background_opacity: 20,
@@ -669,6 +697,7 @@ impl Default for Settings {
             column_widths: ColumnWidths::default(),
             preview_width: None,
             sidebar_width: None,
+            column_view_widths: ColumnViewWidths::default(),
             show_type: true,
             show_size: true,
             show_extension: false,
@@ -679,6 +708,7 @@ impl Default for Settings {
             tray_icon: true,
             menu_hidden: Vec::new(),
             menu_pinned: Vec::new(),
+            menu_pin_owners: std::collections::BTreeMap::new(),
             update_channel_choice: None,
             update_auto: true,
             update_checked: None,

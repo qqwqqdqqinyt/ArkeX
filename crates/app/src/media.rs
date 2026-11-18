@@ -15,23 +15,30 @@
 //! - Type icons: 1 background thread (COM STA) asks the Shell for the icon of each file type
 //!   (by extension, never reading the file) and of a plain folder, once per type and size. These
 //!   replace Arke's drawn kind icons while `prefs::system_type_icons` is on, on any drive.
+//! - Videos: 1 background thread asks a separate process (`thumb_host.rs`) for Windows'
+//!   thumbnail (a frame); Shell thumbnails above skip videos.
+//! - Rust, Shell and video thumbnails are also kept compressed ([`arke_core::thumb_cache`]) in
+//!   memory and on disk, so seeing one again costs a 0.1–0.2 ms decode instead of reading the
+//!   original.
 //! - Thumbnails and system icons only on local fixed drives (cached per drive letter; the check itself runs in the
 //!   background).
 //! - The visible tab calls [`MediaStore::want`] every frame with visible items first; requests
 //!   scrolled away are dropped before work starts (`arke_core::loader`).
-//! - The cache has a memory budget; least recently used entries are freed and removed from the GPU
-//!   atlas.
+//! - Decoded images have a small budget: least recently used ones are freed and removed from the GPU
+//!   atlas, but never the ones on screen or one page around it. Scrolling back decodes them again
+//!   from the compressed copy, on the UI thread while it fits in a few milliseconds.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use arke_core::filetype::{
-    MAX_THUMBNAIL_SOURCE, can_shell_thumbnail, can_thumbnail, shell_thumbnail_ext,
-    wants_system_icon,
+    MAX_THUMBNAIL_SOURCE, can_shell_thumbnail, can_thumbnail, can_video_thumbnail,
+    shell_thumbnail_ext, wants_system_icon, wants_type_icon,
 };
 use arke_core::loader::Loader;
+use arke_core::thumb_cache::{ThumbCache, ThumbKey};
 use arke_core::thumbs::{SOURCE_SIZES, THUMBNAIL_SIZE, Thumbnail, decode_thumbnail};
 use arke_core::{Entry, Fs, SortSpec};
 use gpui::{App, AppContext, Context, Entity, Global, RenderImage, Task};
@@ -41,8 +48,33 @@ use crate::explorer::Services;
 /// System icon size for lists and anywhere no thumbnail size is given (16 px rows, sharp up to
 /// 300% display scale).
 pub(crate) const LIST_ICON_PX: u32 = 48;
-/// Cache budget (decoded pixel bytes). A 192px thumbnail is about 150 KB, so roughly 800 fit.
-const CACHE_BUDGET: usize = 128 * 1024 * 1024;
+/// Path of a type icon's key: `*` can't be in a file name, so it never names a file.
+const TYPE_ICON_PREFIX: &str = "*.";
+/// Decoded pixel bytes kept beyond what is on screen and a page around it. A 192px thumbnail is
+/// about 150 KB, so roughly 100 fit; the compressed copies cover the rest.
+const CACHE_BUDGET: usize = 16 * 1024 * 1024;
+/// Compressed thumbnails in memory: 5–15 KB each, so several thousand.
+const COMPRESSED_BUDGET: usize = 48 * 1024 * 1024;
+/// The disk cache folder's cap (`%LOCALAPPDATA%\Arke\thumbs`): tens of thousands of thumbnails.
+const DISK_CAP: u64 = 256 * 1024 * 1024;
+/// Time per frame for decoding compressed thumbnails on the UI thread (the rest go to the loader).
+const SYNC_DECODE: Duration = Duration::from_millis(3);
+
+/// Thumbnails the background loader was asked for (tests).
+#[cfg(test)]
+pub(crate) static THUMBNAIL_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Compressed thumbnails in memory and on disk, for every window. Tests keep them in memory only.
+pub(crate) fn thumb_cache() -> &'static ThumbCache {
+    static CACHE: OnceLock<ThumbCache> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let dir = std::env::var_os("LOCALAPPDATA")
+            .filter(|_| !cfg!(test))
+            .map(|d| PathBuf::from(d).join("Arke").join("thumbs"));
+        ThumbCache::new(COMPRESSED_BUDGET, dir.map(|d| (d, DISK_CAP)))
+    })
+}
 
 /// Folder peeks remembered before the map is cleared (each is a path and one entry).
 const PEEK_CACHE_MAX: usize = 4096;
@@ -68,6 +100,15 @@ pub(crate) enum MediaKind {
     SystemIcon,
     /// Thumbnail from the Windows Shell (formats Rust can't decode).
     ShellThumbnail,
+    /// A video's thumbnail: a frame, from Windows, made in a separate process (`thumb_host.rs`).
+    Video,
+}
+
+impl MediaKind {
+    /// A picture of the content (shown like a photo), not an icon.
+    pub(crate) const fn is_picture(self) -> bool {
+        matches!(self, Self::Thumbnail | Self::ShellThumbnail | Self::Video)
+    }
 }
 
 /// File path plus mtime and size: an edited file gets a new key and never a stale thumbnail.
@@ -131,12 +172,20 @@ impl MediaKey {
         thumbnail_px: Option<u32>,
         icon_px: u32,
     ) -> Option<Self> {
+        let thumbs = thumbnail_px.is_some();
         let (kind, px) = if wants_system_icon(entry) {
             (MediaKind::SystemIcon, icon_px.max(16))
-        } else if can_thumbnail(entry) {
+        } else if thumbs && can_thumbnail(entry) {
             (MediaKind::Thumbnail, thumbnail_px?)
-        } else if wants_shell_thumbnail(entry) {
+        } else if thumbs && can_video_thumbnail(entry) && shell_thumbnails_enabled() {
+            // Videos: Windows' frame from a separate process (a broken codec can't take Arke down).
+            (MediaKind::Video, thumbnail_px?)
+        } else if thumbs && wants_shell_thumbnail(entry) {
             (MediaKind::ShellThumbnail, thumbnail_px?)
+        } else if !crate::prefs::system_type_icons() {
+            // Windows type icons replace every drawn kind icon when on; otherwise only types the
+            // theme has no icon for get the one their program registered.
+            return Self::type_icon(entry);
         } else {
             return None;
         };
@@ -147,6 +196,33 @@ impl MediaKey {
             kind,
             px,
         })
+    }
+
+    /// Key for the icon Windows has for `entry`'s type ([`wants_type_icon`]): one per
+    /// extension, shared by every file of that type. Reads no file, so also for folders where
+    /// thumbnails and file icons aren't loaded (network shares).
+    pub(crate) fn type_icon(entry: &Entry) -> Option<Self> {
+        wants_type_icon(entry).then(|| Self {
+            path: PathBuf::from(format!("{TYPE_ICON_PREFIX}{}", entry.extension())),
+            modified: None,
+            size: 0,
+            kind: MediaKind::SystemIcon,
+            px: 0,
+        })
+    }
+
+    /// The extension of a [`Self::type_icon`] key.
+    fn type_icon_extension(&self) -> Option<&str> {
+        self.path.to_str()?.strip_prefix(TYPE_ICON_PREFIX)
+    }
+
+    fn thumb_key(&self) -> ThumbKey {
+        ThumbKey {
+            path: self.path.clone(),
+            modified: self.modified,
+            size: self.size,
+            px: self.px,
+        }
     }
 }
 
@@ -242,6 +318,9 @@ pub(crate) fn is_type_icon(image: &RenderImage) -> bool {
 enum MediaEvent {
     TypeIcon(TypeIconKey, Option<Thumbnail>),
     Loaded(MediaKey, Option<Thumbnail>),
+    /// The thumbnail host couldn't be asked: nothing is kept, so the item is asked again the next
+    /// time it's wanted (by then the host may start).
+    Unavailable(MediaKey),
     LocalDisk(PathBuf, bool),
     Peeked(PeekKey, Option<Entry>),
 }
@@ -266,6 +345,7 @@ pub(crate) struct MediaStore {
     type_icons: HashMap<TypeIconKey, Option<Arc<RenderImage>>>,
     /// Each folder's first picture (`None`: it has none, or it couldn't be read)
     peeks: HashMap<PeekKey, Option<Entry>>,
+    videos: Loader<MediaKey>,
     last_wanted: Vec<MediaKey>,
     /// Wanted by the main list (in priority order)
     main_wanted: Vec<MediaKey>,
@@ -310,16 +390,23 @@ impl MediaStore {
         store
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "wires every loader (thumbnails, shell thumbnails, videos, icons) in one place"
+    )]
     fn new(services: Services, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = flume::unbounded::<MediaEvent>();
         let thumbs = {
             let fs = Arc::clone(&services.fs);
             let tx = tx.clone();
             Loader::new("thumbnail", 3, move |key: &MediaKey| {
-                let thumb = fs
-                    .read(&key.path, MAX_THUMBNAIL_SOURCE)
-                    .ok()
-                    .and_then(|bytes| decode_thumbnail(&bytes, key.px.max(1)).ok());
+                #[cfg(test)]
+                THUMBNAIL_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let thumb = thumb_cache().load(&key.thumb_key(), || {
+                    fs.read(&key.path, MAX_THUMBNAIL_SOURCE)
+                        .ok()
+                        .and_then(|bytes| decode_thumbnail(&bytes, key.px.max(1)).ok())
+                });
                 let _ = tx.send(MediaEvent::Loaded(key.clone(), thumb));
             })
         };
@@ -327,7 +414,10 @@ impl MediaStore {
             let shell = Arc::clone(&services.shell);
             let tx = tx.clone();
             Loader::new("system-icon", 1, move |key: &MediaKey| {
-                let icon = shell.file_icon(&key.path, key.px.max(16));
+                let icon = match key.type_icon_extension() {
+                    Some(ext) => shell.registered_type_icon(ext),
+                    None => shell.file_icon(&key.path, key.px.max(16)),
+                };
                 let _ = tx.send(MediaEvent::Loaded(key.clone(), icon));
             })
         };
@@ -338,7 +428,11 @@ impl MediaStore {
                 // Local fixed disks only, like every thumbnail: a provider reads the whole file.
                 let thumb = shell
                     .is_local_disk(&key.path)
-                    .then(|| shell.shell_thumbnail(&key.path, key.px.max(1)))
+                    .then(|| {
+                        thumb_cache().load(&key.thumb_key(), || {
+                            shell.shell_thumbnail(&key.path, key.px.max(1))
+                        })
+                    })
                     .flatten();
                 let _ = tx.send(MediaEvent::Loaded(key.clone(), thumb));
             })
@@ -359,6 +453,41 @@ impl MediaStore {
                 let _ = tx.send(MediaEvent::TypeIcon(key.clone(), icon));
             })
         };
+        let videos = {
+            let shell = Arc::clone(&services.shell);
+            let tx = tx.clone();
+            // Videos Windows had no thumbnail for: not asked again this run (each try can take
+            // seconds, and a broken file stays broken). A changed file has a new key. Not when the
+            // host couldn't be asked at all: that's not the file's doing.
+            let failed: Arc<parking_lot::Mutex<HashSet<ThumbKey>>> = Arc::default();
+            // One at a time: the host makes them one by one anyway.
+            Loader::new("video-thumbnail", 1, move |key: &MediaKey| {
+                let thumb_key = key.thumb_key();
+                let thumb = if failed.lock().contains(&thumb_key) {
+                    None
+                } else {
+                    let mut unavailable = false;
+                    let made = thumb_cache().load(&thumb_key, || {
+                        shell
+                            .video_thumbnail(&key.path, key.px.max(1))
+                            .unwrap_or_else(|_| {
+                                unavailable = true;
+                                None
+                            })
+                    });
+                    if unavailable {
+                        let _ = tx.send(MediaEvent::Unavailable(key.clone()));
+                        return;
+                    }
+                    if made.is_none() {
+                        failed.lock().insert(thumb_key);
+                    }
+                    made
+                };
+                let _ = tx.send(MediaEvent::Loaded(key.clone(), thumb));
+            })
+        };
+        thumb_cache().count_in_background();
         let task = cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv_async().await {
                 if this.update(cx, |this, cx| this.handle(event, cx)).is_err() {
@@ -378,6 +507,7 @@ impl MediaStore {
             type_icon_loader,
             type_icons: HashMap::new(),
             peeks: HashMap::new(),
+            videos,
             last_wanted: Vec::new(),
             main_wanted: Vec::new(),
             side_wanted: Vec::new(),
@@ -403,19 +533,13 @@ impl MediaStore {
                 // Tell the queue the result was taken (it's redone only if evicted and requested
                 // again).
                 self.loader(key.kind).acknowledge(&key);
-                let size = thumb.as_ref().map_or(0, |t| t.rgba.len());
-                let image = thumb.and_then(to_render_image);
-                if key.kind == MediaKind::SystemIcon
-                    && let Some(image) = &image
-                {
-                    // Drawn at icon size like type icons, whatever its pixel size.
-                    TYPE_ICON_IDS.with(|ids| ids.borrow_mut().insert(image.id));
-                }
-                if self.cache.insert(key.clone(), image).is_none() {
-                    self.order.push_back(key);
-                    self.bytes += size;
-                }
+                self.insert(key, thumb);
                 self.evict(cx);
+            }
+            MediaEvent::Unavailable(key) => {
+                self.videos.acknowledge(&key);
+                // Asked again with the next change of what's wanted.
+                self.last_wanted.clear();
             }
             MediaEvent::Peeked(key, first) => {
                 self.peeker.acknowledge(&key);
@@ -437,14 +561,40 @@ impl MediaStore {
             MediaKind::Thumbnail => &self.thumbs,
             MediaKind::SystemIcon => &self.icons,
             MediaKind::ShellThumbnail => &self.shell_thumbs,
+            MediaKind::Video => &self.videos,
         }
     }
 
+    fn insert(&mut self, key: MediaKey, thumb: Option<Thumbnail>) {
+        let size = thumb.as_ref().map_or(0, |t| t.rgba.len());
+        let image = thumb.and_then(to_render_image);
+        if key.kind == MediaKind::SystemIcon
+            && let Some(image) = &image
+        {
+            // Drawn at icon size like type icons, whatever its pixel size.
+            TYPE_ICON_IDS.with(|ids| ids.borrow_mut().insert(image.id));
+        }
+        if self.cache.insert(key.clone(), image).is_none() {
+            self.order.push_back(key);
+            self.bytes += size;
+        }
+    }
+
+    /// Frees the least recently used decoded images over the budget, except the wanted ones.
     fn evict(&mut self, cx: &mut App) {
+        if self.bytes <= CACHE_BUDGET {
+            return;
+        }
+        let wanted: HashSet<&MediaKey> = self.last_wanted.iter().collect();
+        let mut kept = VecDeque::new();
         while self.bytes > CACHE_BUDGET {
             let Some(key) = self.order.pop_front() else {
                 break;
             };
+            if wanted.contains(&key) {
+                kept.push_back(key);
+                continue;
+            }
             if let Some(Some(image)) = self.cache.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(image_bytes(&image));
                 TYPE_ICON_IDS.with(|ids| ids.borrow_mut().remove(&image.id));
@@ -452,6 +602,10 @@ impl MediaStore {
                 // texture in video memory.
                 cx.drop_image(image, None);
             }
+        }
+        // Still on screen: back at the old end, in the same order.
+        while let Some(key) = kept.pop_back() {
+            self.order.push_front(key);
         }
     }
 
@@ -471,6 +625,37 @@ impl MediaStore {
             .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
+    }
+
+    /// Frees every decoded image and forgets what was wanted, like scrolling far away and back.
+    /// Used when the last window closes, and by tests.
+    pub(crate) fn drop_decoded(&mut self, cx: &mut App) {
+        for (_, image) in self.cache.drain() {
+            if let Some(image) = image {
+                cx.drop_image(image, None);
+            }
+        }
+        self.cache.shrink_to_fit();
+        self.order = VecDeque::new();
+        self.bytes = 0;
+        self.main_wanted = Vec::new();
+        self.side_wanted = Vec::new();
+        self.last_wanted = Vec::new();
+    }
+
+    /// Decoded bytes held (tests).
+    #[cfg(test)]
+    pub(crate) const fn decoded_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// With no window open: frees decoded images and the in-memory compressed thumbnails. The
+    /// disk cache stays, so the next window gets its thumbnails back without decoding again.
+    pub(crate) fn release_all(cx: &mut App) {
+        if let Some(store) = cx.try_global::<GlobalMedia>().map(|g| g.0.clone()) {
+            store.update(cx, |store, cx| store.drop_decoded(cx));
+        }
+        thumb_cache().release_memory();
     }
 
     /// Loaded image (`None` if failed or not loaded yet).
@@ -546,13 +731,38 @@ impl MediaStore {
         }
     }
 
-    /// Items the main list needs now (in priority order). Already cached ones are skipped.
-    pub(crate) fn want(&mut self, keys: Vec<MediaKey>) {
+    /// Items the main list needs now (in priority order). Already cached ones are skipped; ones
+    /// with a compressed copy in memory are decoded right away while that stays within a few
+    /// milliseconds, so scrolling back shows them in the same frame.
+    pub(crate) fn want(&mut self, keys: Vec<MediaKey>, cx: &mut Context<Self>) {
         if keys == self.main_wanted {
             return;
         }
+        let start = Instant::now();
+        let mut decoded = false;
+        for key in &keys {
+            if start.elapsed() > SYNC_DECODE {
+                break;
+            }
+            if !key.kind.is_picture() || self.cache.contains_key(key) {
+                continue;
+            }
+            if let Some(thumb) = thumb_cache()
+                .in_memory(&key.thumb_key())
+                .and_then(|bytes| arke_core::thumb_cache::decode(&bytes))
+            {
+                self.insert(key.clone(), Some(thumb));
+                decoded = true;
+            }
+        }
         self.main_wanted = keys;
         self.apply_wanted();
+        // Not now: this runs while a window draws, and `drop_image` skips the window being
+        // updated, so its GPU atlas would keep every freed thumbnail.
+        if decoded {
+            let this = cx.entity();
+            cx.defer(move |cx| this.update(cx, |this, cx| this.evict(cx)));
+        }
     }
 
     /// Items for the side column: queued after the main list and never cancel it.
@@ -624,7 +834,8 @@ impl MediaStore {
         if keys == self.last_wanted {
             return;
         }
-        let (mut thumbs, mut icons, mut shell) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut thumbs, mut icons, mut shell, mut videos) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for key in &keys {
             if self.cache.contains_key(key) {
                 continue;
@@ -633,11 +844,13 @@ impl MediaStore {
                 MediaKind::Thumbnail => thumbs.push(key.clone()),
                 MediaKind::SystemIcon => icons.push(key.clone()),
                 MediaKind::ShellThumbnail => shell.push(key.clone()),
+                MediaKind::Video => videos.push(key.clone()),
             }
         }
         self.thumbs.set_wanted(thumbs);
         self.icons.set_wanted(icons);
         self.shell_thumbs.set_wanted(shell);
+        self.videos.set_wanted(videos);
         // Move used entries to the recent end so visible thumbnails aren't evicted.
         for key in &keys {
             if self.cache.get(key).is_some_and(Option::is_some)

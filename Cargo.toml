@@ -14,7 +14,7 @@ default-members = ["crates/app", "crates/indexd"]
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.3"
 edition = "2024"
 rust-version = "1.100"
 license = "AGPL-3.0-only"
@@ -36,15 +36,20 @@ windows = "0.62"
 windows-core = "0.62"
 notify = "8"
 flume = "0.12"
+# Search index scan threads, kept between queries (already in the build through image and gpui)
+rayon-core = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 memmap2 = "0.9"
+# Search index name dedup: `HashTable` stores only a node id per name (std's HashMap would need
+# the key too); already in the build through accesskit
+hashbrown = { version = "0.16", default-features = false }
 # Fuzzy matching (Helix's engine). MPL-2.0, used unmodified; see THIRD_PARTY_NOTICES.md
 nucleo = "0.5"
 # Archive support: zip (deflate only), tar and .tar.gz
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 # Office Open XML previews (.docx/.xlsx/.pptx): streaming XML reader, no DTD or entity expansion
-quick-xml = "0.41"
+quick-xml = "0.42"
 # Text of PDFs for content search; defaults off (no rayon, no chrono)
 lopdf = { version = "0.47", default-features = false }
 flate2 = "1"
@@ -54,6 +59,8 @@ flate2 = "1"
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["ppmd"] }
 # Thumbnails; same version as gpui so decoded frames can be handed over directly
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+# Thumbnails: JPEGs decoded at 1/2 to 1/8 size in the DCT, so a big photo is never held at full size
+jpeg-decoder = { version = "0.3", default-features = false }
 log = "0.4"
 env_logger = "0.11"
 unicode-segmentation = "1"

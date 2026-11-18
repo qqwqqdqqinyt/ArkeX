@@ -25,7 +25,7 @@ use rust_i18n::t;
 
 use crate::a11y::A11yExt as _;
 use crate::bench::Bench;
-use crate::explorer::{Explorer, ExplorerEvent, PaneInfo, Services, kind_icon};
+use crate::explorer::{Explorer, ExplorerEvent, PaneInfo, Services, StartClock, kind_icon};
 use crate::net_dialog::{NetDialog, NetDialogEvent, NetDialogKind};
 use crate::palette::{Candidate, LocationPalette, PaletteEvent, Source, Target};
 use crate::settings::{SettingsStore, TabLayout};
@@ -41,6 +41,8 @@ pub(crate) mod menuprefs;
 mod nav;
 #[path = "workspace_pages.rs"]
 mod pages;
+#[path = "workspace_rail.rs"]
+mod rail;
 #[path = "workspace_recycle.rs"]
 mod recycle_page;
 #[path = "workspace_report.rs"]
@@ -90,7 +92,9 @@ actions!(
         /// Dual pane: select the items the comparison marked, in both panes.
         SelectDifferences,
         /// The saved workspaces panel.
-        OpenWorkspaces
+        OpenWorkspaces,
+        /// Collapses the sidebar to a column of icons, or expands it (Ctrl+B, #91).
+        ToggleSidebar
     ]
 );
 
@@ -127,6 +131,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-pageup", PrevTab, ctx),
         KeyBinding::new("ctrl-shift-s", ToggleSyncBrowsing, ctx),
         KeyBinding::new("ctrl-shift-d", CompareFolders, ctx),
+        KeyBinding::new("ctrl-b", ToggleSidebar, ctx),
     ]);
     // The folder keys also work on the pages that cover a tab (Home, Settings, the Recycle Bin,
     // What's new), which step aside for the folder under them (#77).
@@ -335,6 +340,14 @@ pub(crate) struct Workspace {
     dragging_pin: bool,
     /// The shelf's items are shown in the sidebar.
     shelf_open: bool,
+    /// The collapsed sidebar is open over the content (pointer resting on it, or the Shelf
+    /// clicked in it).
+    rail_peek: bool,
+    /// Bumped by every hover change, so a pending open or close that is no longer wanted drops.
+    rail_hover: u64,
+    /// A close is pending (the pointer left the open sidebar).
+    peek_closing: bool,
+    sidebar_ui: rail::SidebarUi,
     /// Repaint when the shelf changes (any window may change it).
     _shelf: Subscription,
     last_viewport_width: gpui::Pixels,
@@ -353,6 +366,8 @@ pub(crate) struct Workspace {
     bounds_task: Option<gpui::Task<()>>,
     /// Look version this window last rendered ([`theme::look`]).
     look_seen: u32,
+    /// How this window's start is timed; handed to the pane its first frame shows.
+    start_clock: StartClock,
 }
 
 /// Open network dialog, plus the tab and path to reopen after a successful login.
@@ -486,6 +501,7 @@ fn apply_theme(window: &mut Window, cx: &mut App) {
     let accent = chosen_accent(look.accent);
     // Before the accent and tint: they are worked out against the dark palette.
     theme::set_dark_gray(look.dark_shade == crate::settings::DarkShade::Gray);
+    theme::set_sidebar_collapsed(look.sidebar_collapsed);
     theme::set_accent(accent);
     theme::set_tint(match look.tint {
         crate::settings::Tint::None => None,
@@ -536,6 +552,10 @@ const fn is_dark(appearance: WindowAppearance) -> bool {
 }
 
 impl Workspace {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builds the window state; the resizable sidebar width tipped it over"
+    )]
     pub(crate) fn new(
         services: Services,
         start_path: PathBuf,
@@ -567,6 +587,8 @@ impl Workspace {
             this.home_refresh(cx);
             // Another program may have added or deleted files.
             this.refresh_disk_space(cx);
+            // QuickLook may have been started or quit while Arke was in the background.
+            Self::recheck_quicklook(cx);
             // Shelf items may have been moved or deleted outside Arke.
             let fs = Arc::clone(&this.services.fs);
             crate::shelf::ShelfStore::global(cx).update(cx, |s, cx| s.recheck(fs, cx));
@@ -627,6 +649,10 @@ impl Workspace {
             tab_drag: tabdrag::TabDrag::default(),
             dragging_pin: false,
             shelf_open: false,
+            rail_peek: false,
+            rail_hover: 0,
+            peek_closing: false,
+            sidebar_ui: rail::SidebarUi::default(),
             _shelf: shelf,
             last_viewport_width: px(1200.),
             shared_preview: None,
@@ -638,6 +664,7 @@ impl Workspace {
             _bounds: bounds,
             bounds_task: None,
             look_seen: theme::look(),
+            start_clock: StartClock::for_window(started_at),
         };
         let pane = this.make_pane(start_path, bench, started_at, window, cx);
         this.tabs.push(Tab::new(pane));
@@ -810,19 +837,38 @@ impl Workspace {
                 }
             }
             crate::settings::StartLocation::LastSession => {
-                // Settings loaded after the window: restore all last-session tabs only if this is the only window.
+                // The last tabs are already open in another window (restoring them again would
+                // duplicate them): a new window starts on Home instead (#178).
+                if cx.windows().len() > 1 {
+                    self.open_home_as(false, true, window, cx);
+                    return;
+                }
                 let session = store.settings.session.clone();
                 let Some(first) = session.tabs.first().and_then(|t| t.panes.first()).cloned()
                 else {
                     return;
                 };
-                if cx.windows().len() > 1 {
-                    return;
-                }
                 self.active_view()
                     .update(cx, |v, cx| v.navigate(first, NavKind::New, cx));
                 self.restore_session(&session, window, cx);
             }
+        }
+    }
+
+    /// A window the resident process opened on request: time its start from `received`, when
+    /// the request arrived. Call before the window's first frame.
+    pub(crate) const fn time_from_request(&mut self, received: Instant) {
+        self.start_clock = StartClock::Request(received);
+    }
+
+    /// The window's first frame shows the active tab's panes: the active one takes the window's
+    /// start timing. A page on top (Home, Settings) means no folder's start is timed.
+    fn hand_start_clock(&self, clock: StartClock, cx: &mut Context<Self>) {
+        if clock == StartClock::Untimed {
+            return;
+        }
+        if let Some(view) = self.tabs.get(self.active).map(Tab::view) {
+            view.update(cx, |pane, _| pane.time_start(clock));
         }
     }
 
@@ -1643,8 +1689,8 @@ impl Workspace {
         let reserve = self
             .shared_preview
             .map_or(px(0.), crate::explorer::SharedPreview::reserve);
-        let width = window.viewport_size().width - crate::prefs::sidebar_width() - reserve;
-        let ratio = (event.position.x - crate::prefs::sidebar_width()) / width;
+        let width = window.viewport_size().width - theme::sidebar_width() - reserve;
+        let ratio = (event.position.x - theme::sidebar_width()) / width;
         // Keep at least PANE_MIN per side so the top bar and columns do not get crushed.
         let min = (PANE_MIN / width).min(0.5);
         self.tabs[self.active].ratio = ratio.clamp(min, 1. - min);
@@ -2006,10 +2052,13 @@ impl Workspace {
                             return;
                         }
                         let size = window.viewport_size();
+                        // Over another program's window on top of Arke (a launcher toolbar, an
+                        // always-on-top window) counts as outside: the drop is for it (#128).
                         let inside = e.position.x >= px(0.)
                             && e.position.y >= px(0.)
                             && e.position.x < size.width
-                            && e.position.y < size.height;
+                            && e.position.y < size.height
+                            && !shell.covered_at_cursor(Explorer::owner_from(window));
                         if inside || !cx.has_global::<PendingDragOut>() {
                             return;
                         }
@@ -2050,7 +2099,7 @@ impl Workspace {
 
     /// Content area width (right of the sidebar), from the last painted viewport width.
     fn panes_width_hint(&self) -> gpui::Pixels {
-        self.last_viewport_width - crate::prefs::sidebar_width()
+        self.last_viewport_width - theme::sidebar_width()
     }
 }
 
@@ -2080,6 +2129,8 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::frame_probe::frame_started();
         crate::a11y::sync(window);
+        // Only the first frame times the start.
+        let start_clock = std::mem::take(&mut self.start_clock);
         self.last_viewport_width = window.viewport_size().width;
         self.after_drag(cx);
         self.tab_drag.frame();
@@ -2092,25 +2143,82 @@ impl Render for Workspace {
         self.save_session_if_changed(cx);
         self.refresh_compare(cx);
         let horizontal = Self::horizontal_tabs(cx);
+        // Left column: title row (window drag area) and sidebar, or the column of icons it
+        // collapses to.
+        let left = div()
+            .id("sidebar-column")
+            .debug_selector(|| "sidebar-column".to_owned())
+            .w(theme::sidebar_width())
+            .flex_none()
+            .h_full()
+            .relative()
+            .flex()
+            .flex_col();
+        let left = if let Some((collapsing, serial)) = self.sidebar_ui.motion {
+            // Sliding: the width moves while the full sidebar (clipped) and the column of icons
+            // crossfade. Their icons sit in different places, so swapping one for the other at
+            // the end would read as a jump.
+            let (from, to) = if collapsing {
+                (crate::prefs::sidebar_width(), theme::RAIL_W)
+            } else {
+                (theme::RAIL_W, crate::prefs::sidebar_width())
+            };
+            let full = div()
+                .id("sidebar-slide-full")
+                .debug_selector(|| "sidebar-slide-full".to_owned())
+                .w(crate::prefs::sidebar_width())
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .when(!horizontal, |d| d.child(self.render_brand_row(cx)))
+                .child(self.render_home_button(cx))
+                .child(self.render_sidebar(cx))
+                .child(self.render_settings_button(cx));
+            let rail = div()
+                .id("sidebar-slide-rail")
+                .absolute()
+                .top_0()
+                .left_0()
+                .h_full()
+                .w(theme::RAIL_W)
+                .child(self.render_rail(cx));
+            let fade = |el: gpui::Stateful<gpui::Div>, name: &'static str, going: bool| {
+                gpui::AnimationExt::with_animation(
+                    el,
+                    gpui::ElementId::NamedInteger(name.into(), serial),
+                    gpui::Animation::new(crate::motion::BASE),
+                    move |el, t| el.opacity(crossfade(t, going)),
+                )
+            };
+            gpui::AnimationExt::with_animation(
+                left.overflow_hidden()
+                    .child(fade(full, "sidebar-fade-full", collapsing))
+                    .child(fade(rail, "sidebar-fade-rail", !collapsing)),
+                gpui::ElementId::NamedInteger("sidebar-slide".into(), serial),
+                crate::motion::enter(),
+                move |el, t| el.w(from + (to - from) * t),
+            )
+            .into_any_element()
+        } else {
+            left.when(theme::sidebar_collapsed(), |d| {
+                d.child(self.render_rail(cx))
+            })
+            .children(self.render_peek(cx))
+            .when(!theme::sidebar_collapsed(), |d| {
+                d.when(!horizontal, |d| d.child(self.render_brand_row(cx)))
+                    .child(self.render_home_button(cx))
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_settings_button(cx))
+                    .child(self.render_sidebar_resize_handle(cx))
+            })
+            .into_any_element()
+        };
         let body = div()
             .flex()
             .flex_1()
             .min_h_0()
-            .child(
-                // Left column: title row (window drag area) and sidebar.
-                div()
-                    .relative()
-                    .w(crate::prefs::sidebar_width())
-                    .flex_none()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .when(!horizontal, |d| d.child(self.render_brand_row(cx)))
-                    .child(self.render_home_button(cx))
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_settings_button(cx))
-                    .child(self.render_sidebar_resize_handle(cx)),
-            )
+            .child(left)
             // Settings and Recycle Bin pages replace the panes; the sidebar stays.
             .child(match self.render_settings_page(window, cx) {
                 Some(page) => page,
@@ -2118,10 +2226,14 @@ impl Render for Workspace {
                     Some(page) => page,
                     None => match self.render_home_page(window, cx) {
                         Some(page) => page,
-                        None => match self.render_whats_new_page(window, cx) {
-                            Some(page) => page,
-                            None => self.render_panes(cx),
-                        },
+                        None => {
+                            if let Some(page) = self.render_whats_new_page(window, cx) {
+                                page
+                            } else {
+                                self.hand_start_clock(start_clock, cx);
+                                self.render_panes(cx)
+                            }
+                        }
                     },
                 },
             });
@@ -2141,6 +2253,10 @@ impl Render for Workspace {
                 gpui::Styled::cursor_col_resize,
             )
             .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                this.peek_pointer_moved(e, cx);
+            }))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::close_active))
@@ -2333,6 +2449,21 @@ impl Render for Workspace {
     }
 }
 
+/// Opacity at progress `t` (0 to 1, linear) of a layer leaving (`going`) or arriving in the
+/// sidebar's crossfade: the leaving one is mostly gone before the arriving one is mostly there,
+/// so the two never read as one cluttered layer.
+fn crossfade(t: f32, going: bool) -> f32 {
+    let smooth = |a: f32, b: f32| {
+        let x = ((t - a) / (b - a)).clamp(0., 1.);
+        x * x * (3. - 2. * x)
+    };
+    if going {
+        1. - smooth(0., 0.6)
+    } else {
+        smooth(0.35, 1.)
+    }
+}
+
 impl Workspace {
     /// Vertical tabs: the sidebar top row has the Arke mark, then back, forward and refresh for the
     /// active pane (like Arc); the rest is window drag area. The mark sits on the sidebar's icon
@@ -2428,6 +2559,7 @@ impl Workspace {
                 nav(|e, w, cx| e.refresh(&Refresh, w, cx)),
             ))
             .child(drag_area("brand", cx).h_full().flex_1().min_w_0())
+            .child(div().pr(theme::S_8).child(Self::sidebar_toggle(cx)))
     }
 
     /// Horizontal tabs: tabs on the top row like a browser, caption buttons on the far right.
@@ -2454,7 +2586,21 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(theme::S_4)
-            .pl(theme::S_8)
+            // Collapsed, the toggle is centred over the rail's icons.
+            .map(|d| {
+                if theme::sidebar_collapsed() {
+                    d.child(
+                        div()
+                            .w(theme::RAIL_W)
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .child(Self::sidebar_toggle(cx)),
+                    )
+                } else {
+                    d.pl(theme::S_8).child(Self::sidebar_toggle(cx))
+                }
+            })
             .child(
                 div()
                     .flex()

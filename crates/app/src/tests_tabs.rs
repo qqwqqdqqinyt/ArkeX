@@ -553,6 +553,64 @@ fn copies_to_the_other_pane_select_what_arrived(cx: &mut TestAppContext) {
     assert_eq!(left.update(cx, |e, _| selected_names(e)), ["b.txt"]);
 }
 
+/// The item menu offers "Copy to/Move to other pane" (Alt+C / Alt+M) only in a split tab, and
+/// they copy like the shortcuts do.
+#[gpui::test]
+fn item_menu_copies_to_the_other_pane_only_when_split(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_dir(r"C:\l", vec![file("a.txt", 1), file("b.txt", 1)]);
+    fs.insert_dir(r"C:\r", vec![file("z.txt", 1)]);
+    let shell = Arc::new(FakeShell::default());
+    {
+        let fs = Arc::clone(&fs);
+        *shell.on_op.lock() = Some(Box::new(move |op| {
+            let FileOp::Copy { sources, dest } = op else {
+                return;
+            };
+            let names: Vec<&str> = sources
+                .iter()
+                .map(|p| p.file_name().unwrap().to_str().unwrap())
+                .collect();
+            for name in &names {
+                fs.add_file(dest, name, 1);
+            }
+            fs.emit_changed(dest, &names);
+        }));
+    }
+    let (ws, cx) = setup_workspace_with(cx, fs, Arc::clone(&shell), r"C:\l");
+    let first = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &first, "load", loaded(r"C:\l"));
+    let copy = t!("menu.copy_to_other_pane").into_owned();
+    let mv = t!("menu.move_to_other_pane").into_owned();
+
+    right_click(&first, cx, Some(1));
+    let labels = menu_labels(&first, cx).expect("a menu opens");
+    assert!(
+        !labels.contains(&copy) && !labels.contains(&mv),
+        "one pane: nothing to copy to, {labels:?}"
+    );
+
+    let (left, right) = split_to(&ws, cx, r"C:\r");
+    right_click(&left, cx, Some(1));
+    let labels = menu_labels(&left, cx).expect("a menu opens");
+    let at = labels.iter().position(|l| *l == copy).expect("copy item");
+    assert_eq!(labels.get(at + 1), Some(&mv), "move right under copy");
+    let shortcuts = left.update(cx, |e, _| {
+        let menu = e.context_menu.as_ref().expect("still open");
+        [menu.shortcut_of(&copy), menu.shortcut_of(&mv)]
+    });
+    assert_eq!(shortcuts, [Some("Alt+C"), Some("Alt+M")]);
+
+    run_command(&left, cx, MenuCommand::CopyToPeer);
+    wait_until(cx, &right, "the copy is selected on the right", |e| {
+        selected_names(e) == ["b.txt"]
+    });
+    assert!(
+        matches!(shell.ops.lock().as_slice(), [FileOp::Copy { dest, .. }] if dest == Path::new(r"C:\r")),
+        "copied into the other pane's folder"
+    );
+}
+
 /// Closing a split from the right side keeps the two folders in their on-screen order: the left
 /// one becomes the tab before.
 #[gpui::test]
@@ -1238,8 +1296,10 @@ fn a_new_window_follows_startup_when_settings_are_already_read(cx: &mut TestAppC
     });
     let home = t!("home.title").into_owned();
     for (start, expect_page, expect_folder) in [
-        (StartLocation::HomePage, Some(home), r"C:\Users\me"),
+        (StartLocation::HomePage, Some(home.clone()), r"C:\Users\me"),
         (StartLocation::LastFolder, None, r"C:\last"),
+        // Last tabs, with other windows open: Home, not the tabs again or the profile (#178).
+        (StartLocation::LastSession, Some(home), r"C:\Users\me"),
     ] {
         cx.update(|cx| {
             SettingsStore::global(cx).update(cx, |s, cx| {
@@ -1272,6 +1332,360 @@ fn a_new_window_follows_startup_when_settings_are_already_read(cx: &mut TestAppC
             ws.update(vcx, |ws, _| ws.shown_page_for_test()),
             expect_page,
             "{start:?}"
+        );
+    }
+}
+
+/// Ctrl+B collapses the sidebar to a column of icons and back (#91); the setting keeps it.
+#[gpui::test]
+fn ctrl_b_collapses_the_sidebar(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_many(r"C:\a", 1);
+    let (ws, cx) = setup_workspace(cx, fs, r"C:\a");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"C:\a"));
+    assert!(cx.debug_bounds("sidebar-rail").is_none());
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.run_until_parked();
+    assert!(settings(cx).sidebar_collapsed);
+    assert_eq!(crate::theme::sidebar_width(), crate::theme::RAIL_W);
+    assert!(
+        cx.debug_bounds("sidebar-rail").is_some(),
+        "the column of icons shows"
+    );
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.run_until_parked();
+    assert!(!settings(cx).sidebar_collapsed);
+    assert_eq!(crate::theme::sidebar_width(), crate::theme::SIDEBAR_W);
+    assert!(cx.debug_bounds("sidebar-rail").is_none());
+}
+
+/// Ctrl+B slides the sidebar's width instead of switching at once. While it slides, the full
+/// sidebar and the column of icons crossfade (their icons sit in different places, so swapping
+/// at the end would jump); afterwards only one is drawn.
+#[gpui::test]
+fn ctrl_b_slides_the_sidebar(cx: &mut TestAppContext) {
+    crate::motion::force_for_test(true);
+    let fs = FakeFs::new();
+    fs.insert_many(r"C:", 1);
+    let (ws, cx) = setup_workspace(cx, fs, r"C:");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"C:"));
+    let both = |cx: &mut VisualTestContext| {
+        (
+            cx.debug_bounds("sidebar-slide-full").is_some(),
+            cx.debug_bounds("sidebar-rail").is_some(),
+        )
+    };
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.run_until_parked();
+    assert!(settings(cx).sidebar_collapsed);
+    let sliding = cx.debug_bounds("sidebar-column").unwrap();
+    assert!(
+        sliding.size.width > crate::theme::RAIL_W,
+        "still wider than the column of icons: {sliding:?}"
+    );
+    assert_eq!(both(cx), (true, true), "crossfading");
+    cx.executor()
+        .advance_clock(crate::motion::BASE + Duration::from_millis(60));
+    cx.run_until_parked();
+    assert_eq!(both(cx), (false, true), "slide over");
+    assert_eq!(
+        cx.debug_bounds("sidebar-column").unwrap().size.width,
+        crate::theme::RAIL_W
+    );
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.run_until_parked();
+    assert_eq!(both(cx), (true, true), "crossfading back");
+    cx.executor()
+        .advance_clock(crate::motion::BASE + Duration::from_millis(60));
+    cx.run_until_parked();
+    assert_eq!(both(cx), (false, false), "full sidebar only");
+    assert_eq!(
+        cx.debug_bounds("sidebar-column").unwrap().size.width,
+        crate::theme::SIDEBAR_W
+    );
+    crate::motion::force_for_test(false);
+}
+
+fn change(cx: &mut VisualTestContext, f: impl FnOnce(&mut crate::settings::Settings) + 'static) {
+    cx.update(|_, cx| {
+        crate::settings::SettingsStore::global(cx).update(cx, |s, cx| s.update(f, cx));
+    });
+    cx.run_until_parked();
+}
+
+/// #122: collapsed, the column also has the pinned folders, the Recycle Bin, the Shelf and the
+/// drives (as their letters).
+#[gpui::test]
+fn the_collapsed_sidebar_has_pins_and_drives(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_many(r"C:\a", 1);
+    fs.insert_many(r"C:\work", 1);
+    let shell = Arc::new(FakeShell::default());
+    shell.extra_places.lock().push(crate::shell::Place {
+        label: "Local Disk (C:)".into(),
+        path: p(r"C:\"),
+        kind: crate::shell::PlaceKind::Drive {
+            remote: false,
+            space: None,
+        },
+    });
+    let (ws, cx) = setup_workspace_with(cx, fs, shell, r"C:\a");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"C:\a"));
+    change(cx, |st| {
+        st.pinned = vec![p(r"C:\work")];
+        st.recycle_pinned = true;
+        st.sidebar_collapsed = true;
+    });
+    // debug_bounds takes static names.
+    let wanted: Vec<&'static str> = [
+        "rail work".to_owned(),
+        format!("rail {}", t!("recycle.title")),
+        format!("rail {}", t!("shelf.title")),
+        "rail Local Disk (C:)".to_owned(),
+    ]
+    .into_iter()
+    .map(|s| &*Box::leak(s.into_boxed_str()))
+    .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while wanted.iter().any(|s| cx.debug_bounds(s).is_none()) {
+        assert!(Instant::now() < deadline, "missing in the rail");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The pinned folder opens here.
+    let at = cx.debug_bounds("rail work").unwrap().center();
+    cx.simulate_click(at, gpui::Modifiers::none());
+    wait_until(cx, &view, "work", loaded(r"C:\work"));
+}
+
+/// #122: resting the pointer on the collapsed column opens the full sidebar over the content; it
+/// closes once the pointer moves past it, and a pass straight across opens nothing. Right click
+/// turns it off.
+#[gpui::test]
+fn the_collapsed_sidebar_opens_while_the_pointer_rests_on_it(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_many(r"C:\a", 1);
+    let (ws, cx) = setup_workspace(cx, fs, r"C:\a");
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(r"C:\a"));
+    change(cx, |st| st.sidebar_collapsed = true);
+    let peek = |cx: &mut VisualTestContext| ws.update(cx, |ws, _| ws.peek_for_test());
+    let rail = cx.debug_bounds("sidebar-rail").unwrap().center();
+    let content = gpui::point(crate::theme::SIDEBAR_W + gpui::px(200.), rail.y);
+    let none = gpui::Modifiers::none();
+
+    // Crossing the column without resting opens nothing.
+    cx.simulate_mouse_move(rail, None, none);
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.simulate_mouse_move(content, None, none);
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    assert!(!peek(cx));
+
+    // Resting opens it over the content.
+    cx.simulate_mouse_move(rail, None, none);
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(peek(cx));
+    assert!(cx.debug_bounds("sidebar-peek").is_some());
+    assert!(settings(cx).sidebar_collapsed, "only shown, not expanded");
+
+    // Moving within it keeps it; leaving closes it.
+    cx.simulate_mouse_move(
+        gpui::point(crate::theme::SIDEBAR_W - gpui::px(20.), rail.y),
+        None,
+        none,
+    );
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(peek(cx));
+    // Out and straight back over it: stays open.
+    cx.simulate_mouse_move(content, None, none);
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.simulate_mouse_move(
+        gpui::point(crate::theme::SIDEBAR_W - gpui::px(20.), rail.y),
+        None,
+        none,
+    );
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(peek(cx), "came back before it closed");
+    cx.simulate_mouse_move(content, None, none);
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(!peek(cx));
+    assert!(cx.debug_bounds("sidebar-peek").is_none());
+
+    // Off: resting does nothing.
+    change(cx, |st| st.sidebar_peek = false);
+    cx.simulate_mouse_move(rail, None, none);
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(!peek(cx));
+}
+
+/// A tab in the background keeps following its folder (its watcher sleeps until a change instead
+/// of polling): switching back shows what changed meanwhile, without a relist.
+#[gpui::test]
+fn background_tab_is_current_when_switched_back(cx: &mut TestAppContext) {
+    let fs = FakeFs::new();
+    fs.insert_many(r"C:\a", 2);
+    fs.insert_many(r"C:\b", 1);
+    let (ws, cx) = setup_workspace(cx, Arc::clone(&fs), r"C:\a");
+    let first = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &first, "load", loaded(r"C:\a"));
+    open_tabs(&ws, cx, &[r"C:\b"]);
+    assert_eq!(active(&ws, cx), 1);
+    let a = Path::new(r"C:\a");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fs.watcher_count(a) == 0 {
+        assert!(Instant::now() < deadline, "watcher did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reads = fs.read_dir_calls();
+    fs.add_file(a, "while-away.txt", 1);
+    fs.remove(a, "file_000000.txt");
+    fs.emit_changed(a, &["while-away.txt", "file_000000.txt"]);
+    wait_until(cx, &first, "background tab updated", |v| {
+        names(v) == ["file_000001.txt", "while-away.txt"]
+    });
+    cx.simulate_keystrokes("ctrl-1");
+    cx.run_until_parked();
+    assert_eq!(active(&ws, cx), 0);
+    assert_eq!(
+        first.update(cx, |v, _| names(v)),
+        ["file_000001.txt", "while-away.txt"]
+    );
+    assert_eq!(fs.read_dir_calls(), reads, "no relist needed");
+}
+
+/// A sidebar with eight drives and `tabs` tabs, in a window `height` tall.
+fn sidebar_with_tabs(
+    cx: &mut TestAppContext,
+    tabs: usize,
+    height: f32,
+) -> (Entity<Workspace>, &mut VisualTestContext) {
+    let fs = FakeFs::new();
+    let paths: Vec<String> = (0..tabs).map(|i| format!(r"C:\t{i}")).collect();
+    for path in &paths {
+        fs.insert_many(path, 1);
+    }
+    let shell = Arc::new(FakeShell::default());
+    shell
+        .extra_places
+        .lock()
+        .extend((b'D'..=b'K').map(|letter| crate::shell::Place {
+            label: format!("Disk ({}:)", letter as char),
+            path: PathBuf::from(format!(r"{}:\", letter as char)),
+            kind: crate::shell::PlaceKind::Drive {
+                remote: false,
+                space: None,
+            },
+        }));
+    let (ws, cx) = setup_workspace_with(cx, fs, shell, &paths[0]);
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(&paths[0]));
+    let rest: Vec<&str> = paths[1..].iter().map(String::as_str).collect();
+    open_tabs(&ws, cx, &rest);
+    cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(height)));
+    for _ in 0..3 {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+    (ws, cx)
+}
+
+/// Shown in the vertical tab list: tab `ix` is drawn and its bottom inside the list.
+fn tab_shown(cx: &mut VisualTestContext, ix: usize) -> bool {
+    let id: &'static str = Box::leak(format!("tab-{ix}").into_boxed_str());
+    let list = cx.debug_bounds("sidebar-tabs-frame").unwrap();
+    cx.debug_bounds(id)
+        .is_some_and(|b| b.top() >= list.top() && b.bottom() <= list.bottom() + gpui::px(1.))
+}
+
+/// Many tabs don't squeeze the places (This PC, drives) above them: the tab list gives way
+/// first and scrolls.
+#[gpui::test]
+fn many_tabs_leave_the_places_alone(cx: &mut TestAppContext) {
+    let (ws, cx) = sidebar_with_tabs(cx, 20, 1000.);
+    // Less than a pixel: rounding, not squeezed.
+    assert!(ws.update(cx, |ws, _| ws.places_overflow_for_test()) < gpui::px(1.));
+    assert!(tab_shown(cx, 0) && tab_shown(cx, 2), "the first tabs show");
+    assert!(!tab_shown(cx, 19), "the rest scroll");
+}
+
+/// A short window: the tabs give way down to three, then the places shrink too and scroll.
+#[gpui::test]
+fn a_short_window_keeps_three_tabs_then_shrinks_the_places(cx: &mut TestAppContext) {
+    let (ws, cx) = sidebar_with_tabs(cx, 20, 520.);
+    assert!(ws.update(cx, |ws, _| ws.places_overflow_for_test()) > gpui::px(0.));
+    for ix in 0..3 {
+        assert!(tab_shown(cx, ix), "tab {ix} shows");
+    }
+}
+
+/// Few tabs: nothing scrolls and nothing is cut.
+#[gpui::test]
+fn few_tabs_and_room_to_spare_scroll_nothing(cx: &mut TestAppContext) {
+    let (ws, cx) = sidebar_with_tabs(cx, 3, 1000.);
+    // Less than a pixel: rounding, not squeezed.
+    assert!(ws.update(cx, |ws, _| ws.places_overflow_for_test()) < gpui::px(1.));
+    for ix in 0..3 {
+        assert!(tab_shown(cx, ix), "tab {ix} shows");
+    }
+}
+
+/// A folder whose name alone is wider than the path bar (a narrow, not maximized window):
+/// the name truncates inside the bar instead of running over the title bar next to it, with
+/// tabs on the left or on top.
+#[gpui::test]
+fn a_very_long_folder_name_stays_inside_the_path_bar(cx: &mut TestAppContext) {
+    let long = format!(
+        r"C:\top1\{}",
+        // Wide characters too (written escaped: no UI text in source).
+        "[ABC-41][2015] Vol.41 \u{5929}\u{4f7f}\u{3068}\u{60aa}\u{9b54} a very long folder name "
+            .repeat(4)
+    );
+    let fs = FakeFs::new();
+    fs.insert_many(&long, 1);
+    let (ws, cx) = setup_workspace_with(cx, fs, Arc::new(FakeShell::default()), &long);
+    let view = ws.update(cx, |ws, _| ws.active_view().clone());
+    wait_until(cx, &view, "load", loaded(&long));
+    for horizontal in [false, true] {
+        if horizontal {
+            cx.update(|_, cx| {
+                crate::settings::SettingsStore::global(cx).update(cx, |s, cx| {
+                    s.update(
+                        |st| st.tab_layout = crate::settings::TabLayout::Horizontal,
+                        cx,
+                    );
+                });
+            });
+        }
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+        for _ in 0..3 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        let bar = cx.debug_bounds("path-bar").expect("path bar drawn");
+        let current = cx.debug_bounds("crumb-2").expect("current folder drawn");
+        assert!(
+            current.right() <= bar.right() + gpui::px(0.5),
+            "horizontal tabs {horizontal}: current folder ends at {:?}, past the bar at {:?}",
+            current.right(),
+            bar.right()
+        );
+        assert!(
+            bar.right() <= gpui::px(900.),
+            "horizontal tabs {horizontal}: the bar stays in the window"
         );
     }
 }

@@ -115,6 +115,8 @@ mod recorder {
         /// Failed items (path when known, display name, reason), reported together when Windows
         /// shows no error UI.
         pub(super) failed: std::cell::RefCell<Vec<(Option<PathBuf>, String, HRESULT)>>,
+        /// For a delete: only these items count as done (see [`super::TopItems`]).
+        pub(super) top: Option<super::TopItems>,
     }
 
     /// One completed item.
@@ -328,7 +330,19 @@ mod recorder {
             hr: HRESULT,
             now: windows::core::Ref<IShellItem>,
         ) -> windows::core::Result<()> {
-            self.tick();
+            match &self.top {
+                Some(top) => {
+                    if super::finished(hr)
+                        && item
+                            .as_ref()
+                            .and_then(item_path)
+                            .is_some_and(|p| top.first_finish(&p))
+                    {
+                        self.tick();
+                    }
+                }
+                None => self.tick(),
+            }
             self.check(hr, item.as_ref());
             // When recycling, `now` is the item in the Recycle Bin; for permanent deletes it
             // is null and nothing is recorded.
@@ -378,6 +392,65 @@ mod recorder {
 }
 
 use recorder::{Done, Recorder};
+
+/// The items a delete was given. The engine also reports items inside them and reports failed
+/// items, and after "Delete permanently?" the same item again, so counting every report showed more
+/// items done than were selected. Only these count, each once.
+struct TopItems {
+    /// [`recycled_key`] of each item, plus its short (8.3) form, which the engine may report.
+    keys: std::collections::HashSet<(String, String)>,
+    counted: std::cell::RefCell<std::collections::HashSet<(String, String)>>,
+}
+
+impl TopItems {
+    fn new(paths: &[PathBuf], shorts: &[((String, String), PathBuf)]) -> Self {
+        let keys = paths
+            .iter()
+            .filter_map(|path| {
+                let plain = arke_core::path::unverbatim(path);
+                Some(recycled_key(plain.parent()?, plain.file_name()?))
+            })
+            .chain(shorts.iter().map(|(short, _)| short.clone()))
+            .collect();
+        Self {
+            keys,
+            counted: std::cell::RefCell::default(),
+        }
+    }
+
+    /// Whether `path` is one of the items, seen finished for the first time.
+    fn first_finish(&self, path: &Path) -> bool {
+        let plain = arke_core::path::unverbatim(path);
+        let (Some(folder), Some(name)) = (plain.parent(), plain.file_name()) else {
+            return false;
+        };
+        let name = name.to_string_lossy().to_lowercase();
+        // Cheap name check first: inside a folder deleted for good there can be many thousands.
+        if !self.keys.iter().any(|(_, n)| *n == name) {
+            return false;
+        }
+        let key = recycled_key(folder, std::ffi::OsStr::new(&name));
+        self.keys.contains(&key) && self.counted.borrow_mut().insert(key)
+    }
+}
+
+/// The engine finished the item. Success codes include a recycled folder's "don't process
+/// children"; skipped and retried items are not done.
+fn finished(hr: HRESULT) -> bool {
+    use windows::Win32::UI::Shell::{
+        COPYENGINE_S_NOT_HANDLED, COPYENGINE_S_PENDING, COPYENGINE_S_USER_IGNORED,
+        COPYENGINE_S_USER_RETRY,
+    };
+    (hr.is_ok()
+        && ![
+            COPYENGINE_S_USER_IGNORED,
+            COPYENGINE_S_USER_RETRY,
+            COPYENGINE_S_NOT_HANDLED,
+            COPYENGINE_S_PENDING,
+        ]
+        .contains(&hr))
+        || is_gone(hr)
+}
 
 /// Item already gone (e.g. a link target deleted earlier in the batch); treated as done.
 fn is_gone(hr: HRESULT) -> bool {
@@ -503,8 +576,16 @@ pub(crate) fn perform_tracked(
             recycle: true,
         } if crate::win_fast_recycle::enabled() => {
             let mut left = Vec::new();
+            let mut batch = crate::win_fast_recycle::Batch::default();
+            let mut cancelled = false;
             for path in paths {
-                match crate::win_fast_recycle::recycle(path) {
+                // Like the engine: stop before the next item; what is in the bin stays there,
+                // and undo puts it back.
+                if progress.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+                match batch.recycle(path) {
                     Some(now) => {
                         progress
                             .done
@@ -514,8 +595,17 @@ pub(crate) fn perform_tracked(
                     None => left.push(path.clone()),
                 }
             }
-            if left.is_empty() {
-                return (Ok(OpOutcome::Done), Some(Undo::PutBack(fast)));
+            batch.finish();
+            if cancelled || left.is_empty() {
+                let outcome = if cancelled {
+                    OpOutcome::Cancelled
+                } else {
+                    OpOutcome::Done
+                };
+                return (
+                    Ok(outcome),
+                    (!fast.is_empty()).then_some(Undo::PutBack(fast)),
+                );
             }
             rest = FileOp::Delete {
                 paths: left,
@@ -567,6 +657,7 @@ fn perform_recorded(
         done: std::cell::RefCell::new(Vec::new()),
         progress,
         failed: std::cell::RefCell::new(Vec::new()),
+        top: recycled.map(|paths| TopItems::new(paths, &shorts)),
     }
     .into();
     let mut failed = Vec::new();
@@ -760,6 +851,11 @@ pub(crate) fn undo_tracked(
         done: std::cell::RefCell::new(Vec::new()),
         progress: Some(Arc::clone(progress)),
         failed: std::cell::RefCell::new(Vec::new()),
+        // Undoing a copy recycles the copies: count those like any recycle.
+        top: match undo {
+            Undo::Remove(paths) => Some(TopItems::new(paths, &[])),
+            Undo::PutBack(_) => None,
+        },
     }
     .into();
     HIDE_PROGRESS.set(true);
@@ -1094,7 +1190,7 @@ pub(crate) fn drag_out(
         }
         // Custom drop source: cancel when the cursor returns to the Arke window so Arke's
         // internal drag can take over.
-        let home = windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow();
+        let home = drag_home();
         let source = drag_source::ReturnAware::new(home);
         let returned = Rc::clone(&source.returned);
         let source: windows::Win32::System::Ole::IDropSource = source.into();
@@ -1114,6 +1210,23 @@ pub(crate) fn drag_out(
         } else {
             None
         })
+    }
+}
+
+/// The Arke window the drag started in: the one holding the mouse since the press. A press on a
+/// window behind another program doesn't activate it (like Explorer, so the window doesn't cover
+/// the drop target), so the active window can be none; it is the fallback.
+fn drag_home() -> HWND {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetCapture};
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+    // SAFETY: plain queries about this thread's windows.
+    unsafe {
+        let captured = GetCapture();
+        if captured.is_invalid() {
+            GetActiveWindow()
+        } else {
+            GetAncestor(captured, GA_ROOT)
+        }
     }
 }
 
@@ -1160,19 +1273,28 @@ fn add_hdrop(
 /// The data object for a drag, before CF_HDROP is added. For files on local drives it also
 /// carries Shell IDList Array, as Explorer's drags do: some targets take only that, such as
 /// shortcuts on launcher toolbars (#109). `SHCreateDataObject` builds the shell's own object from
-/// the PIDLs without binding any handler, so no third-party code loads. Network paths keep the
-/// plain object: parsing them could wait on the network, and this runs on the UI thread.
+/// the PIDLs without binding any handler for the items (Explorer's `GetUIObjectOf` can load a
+/// file type's data handler), so no third-party code loads. Network paths keep the plain object:
+/// parsing them could wait on the network, and this runs on the UI thread.
+///
+/// Items of one folder are given as that folder plus one-level child IDs, so the object has the
+/// shape of the one Explorer's folder hands out for the same files: a target may expect every ID
+/// to be a direct child of the folder in the array, as it always is in Explorer's drags.
+/// Items from different folders (search results) use the desktop as the folder and full IDs.
 fn drag_data_object(
     paths: &[PathBuf],
 ) -> windows::core::Result<windows::Win32::System::Com::IDataObject> {
     use windows::Win32::System::Com::{CoTaskMemFree, IDataObject};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{SHCreateDataObject, SHParseDisplayName};
+    use windows::Win32::UI::Shell::{
+        ILFindLastID, IPersistFolder2, SHBindToParent, SHCreateDataObject, SHParseDisplayName,
+    };
     struct Pidls(Vec<*mut ITEMIDLIST>);
     impl Drop for Pidls {
         fn drop(&mut self) {
             for pidl in &self.0 {
-                // SAFETY: allocated by SHParseDisplayName with CoTaskMemAlloc; freed once each.
+                // SAFETY: allocated with CoTaskMemAlloc (SHParseDisplayName, GetCurFolder);
+                // freed once each.
                 unsafe { CoTaskMemFree(Some(pidl.cast_const().cast())) };
             }
         }
@@ -1187,32 +1309,91 @@ fn drag_data_object(
     {
         return plain();
     }
-    let mut pidls = Pidls(Vec::with_capacity(paths.len()));
-    for path in paths {
+    let parse = |path: &Path| {
         let name = wide(path.as_os_str());
         let mut pidl = std::ptr::null_mut();
-        // SAFETY: name is NUL-terminated; pidl is an out variable owned by Pidls on success.
-        if unsafe { SHParseDisplayName(PCWSTR(name.as_ptr()), None, &raw mut pidl, 0, None) }
-            .is_err()
-        {
+        // SAFETY: name is NUL-terminated; pidl is an out variable, owned by the caller on success.
+        unsafe { SHParseDisplayName(PCWSTR(name.as_ptr()), None, &raw mut pidl, 0, None) }
+            .ok()
+            .map(|()| pidl)
+    };
+    let mut pidls = Pidls(Vec::with_capacity(paths.len() + 1));
+    for path in paths {
+        let Some(pidl) = parse(path) else {
             return plain();
-        }
+        };
         pidls.0.push(pidl);
     }
-    let list: Vec<*const ITEMIDLIST> = pidls.0.iter().map(|p| p.cast_const()).collect();
-    // The desktop (an empty PIDL) as the folder, so full PIDLs are its children and items from
-    // different folders (search results) go in one object.
-    let desktop = [0u16; 1];
-    // SAFETY: an empty ITEMIDLIST is just its zero terminator; the PIDLs stay alive (Pidls) for
-    // the call, and the data object keeps its own copy.
-    unsafe {
-        SHCreateDataObject::<_, IDataObject>(
-            Some(desktop.as_ptr().cast::<ITEMIDLIST>()),
-            Some(&list),
-            None::<&IDataObject>,
-        )
+    // The folder's ID as the folder itself gives it (what Explorer's drags carry), which can be
+    // shorter than the parsed path's.
+    let folder = common_parent(paths).and_then(|_| {
+        // SAFETY: the first item's PIDL is valid; the folder's copy of its own ID is
+        // CoTaskMemAlloc'ed and freed with the others (Pidls).
+        let pidl = unsafe {
+            SHBindToParent::<IPersistFolder2>(pidls.0[0].cast_const(), None)
+                .and_then(|folder| folder.GetCurFolder())
+        }
+        .ok()?;
+        pidls.0.push(pidl);
+        Some(pidl)
+    });
+    let last_id = |pidl: &*mut ITEMIDLIST| {
+        // SAFETY: pidl is a valid, zero-terminated list from SHParseDisplayName; its last ID
+        // points into it and stays valid while Pidls is alive.
+        unsafe { ILFindLastID(pidl.cast_const()) }.cast_const()
+    };
+    let (folder, list): (*const ITEMIDLIST, Vec<*const ITEMIDLIST>) = match folder {
+        Some(folder) => (
+            folder.cast_const(),
+            pidls.0[..paths.len()].iter().map(last_id).collect(),
+        ),
+        // The desktop (an empty PIDL) as the folder, so full PIDLs are its children and items
+        // from different folders go in one object.
+        None => (
+            DESKTOP_PIDL.as_ptr().cast::<ITEMIDLIST>(),
+            pidls.0.iter().map(|p| p.cast_const()).collect(),
+        ),
+    };
+    // SAFETY: the folder and item IDs stay alive (Pidls, or the static empty list) for the call,
+    // and the data object keeps its own copy.
+    unsafe { SHCreateDataObject::<_, IDataObject>(Some(folder), Some(&list), None::<&IDataObject>) }
+        .or_else(|_| plain())
+}
+
+/// An empty ITEMIDLIST (the desktop): just its zero terminator.
+static DESKTOP_PIDL: [u16; 1] = [0];
+
+/// The folder all `paths` are directly in, if there is one (a drive root has none).
+fn common_parent(paths: &[PathBuf]) -> Option<&Path> {
+    let (first, rest) = paths.split_first()?;
+    let parent = first.parent().filter(|p| !p.as_os_str().is_empty())?;
+    rest.iter()
+        .all(|p| p.parent() == Some(parent))
+        .then_some(parent)
+}
+
+/// Whether the top-level window under the cursor is another one than `home`: another program's
+/// window on top of Arke (a launcher toolbar, an always-on-top window), or outside Arke
+/// altogether. Windows that ignore the mouse (the drag image) aren't counted.
+pub(crate) fn other_window_at_cursor(home: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
+    };
+    if home.is_invalid() {
+        return false;
     }
-    .or_else(|_| plain())
+    // SAFETY: plain window queries with valid out pointers.
+    unsafe {
+        let mut cursor = POINT::default();
+        if GetCursorPos(&raw mut cursor).is_err() {
+            return false;
+        }
+        let hit = WindowFromPoint(cursor);
+        if hit.is_invalid() {
+            return false;
+        }
+        GetAncestor(hit, GA_ROOT) != home
+    }
 }
 
 /// What the drop target did with dragged-out files.
@@ -1265,9 +1446,10 @@ mod drag_source {
             }
         }
 
-        /// Whether the cursor is inside the Arke client area.
+        /// Whether the cursor is inside the Arke client area, on Arke itself rather than on
+        /// another program's window on top of it (#128).
         fn cursor_home(&self) -> bool {
-            if self.home.is_invalid() {
+            if self.home.is_invalid() || super::other_window_at_cursor(self.home) {
                 return false;
             }
             // SAFETY: pointers are valid; home is this thread's window and can't close during
@@ -1675,9 +1857,41 @@ mod tests {
         }
     }
 
+    impl Sandbox {
+        /// Permanently deletes the Recycle Bin entries this sandbox put there, found by
+        /// their original location (a path component named like the sandbox). Runs on drop,
+        /// so it also covers a test that failed halfway. Other bin items are never touched.
+        fn purge_own_recycled(&self) {
+            let Some(own) = self
+                .0
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+            else {
+                return;
+            };
+            let Ok(items) = crate::win_recycle::list() else {
+                return;
+            };
+            let mine: Vec<String> = items
+                .into_iter()
+                .filter(|item| {
+                    item.from
+                        .components()
+                        .any(|c| c.as_os_str().to_string_lossy().to_lowercase() == own)
+                })
+                .map(|item| item.now)
+                .collect();
+            let mine: Vec<&str> = mine.iter().map(String::as_str).collect();
+            if !mine.is_empty() {
+                let _ = purge_recycled(&mine, None);
+            }
+        }
+    }
+
     impl Drop for Sandbox {
         fn drop(&mut self) {
             if self.0.starts_with(crate::win::long_temp_dir()) {
+                self.purge_own_recycled();
                 // Verbatim: tests leave names and lengths only `\\?\` paths reach.
                 let _ = fs::remove_dir_all(arke_core::path::verbatim(&self.0));
             }
@@ -2043,13 +2257,79 @@ mod tests {
     /// Runs an operation the way the app does (Arke's progress, no Windows error UI), failing the
     /// test instead of hanging if Windows shows a dialog.
     fn tracked(op: FileOp) -> (Result<OpOutcome, ShellError>, Option<Undo>) {
-        let progress = std::sync::Arc::new(crate::shell::OpProgress::default());
+        tracked_with(op, &Arc::new(crate::shell::OpProgress::default()))
+    }
+
+    fn tracked_with(
+        op: FileOp,
+        progress: &Arc<crate::shell::OpProgress>,
+    ) -> (Result<OpOutcome, ShellError>, Option<Undo>) {
+        let progress = Arc::clone(progress);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(perform_tracked(&op, None, &progress));
         });
         rx.recv_timeout(Duration::from_secs(30))
             .expect("the operation did not finish: Windows may be showing a dialog")
+    }
+
+    /// Recycling two folders where one holds a file in use: the engine reports both, the failed one
+    /// too, but only the folder that went to the bin counts as done.
+    #[test]
+    fn recycle_progress_counts_only_the_selected_items() {
+        use std::sync::atomic::Ordering;
+        let sb = Sandbox::new("recycle-count");
+        sb.file(r"free\a.txt", "a");
+        sb.file(r"free\deep\b.txt", "b");
+        sb.file(r"busy\c.txt", "c");
+        let locked = sb.file(r"busy\deep\locked.txt", "l");
+        let (free, busy) = (sb.0.join("free"), sb.0.join("busy"));
+        let holder = crate::win_inuse::test_support::lock_in_other_process(&locked);
+        let progress = Arc::new(crate::shell::OpProgress::default());
+        let (result, undo) = tracked_with(
+            FileOp::Delete {
+                paths: vec![free.clone(), busy.clone()],
+                recycle: true,
+            },
+            &progress,
+        );
+        drop(holder);
+        let error = result
+            .as_ref()
+            .map_or_else(ToString::to_string, |_| String::new());
+        assert!(!free.exists(), "{error}");
+        assert!(busy.exists(), "{error}");
+        assert_eq!(progress.done.load(Ordering::Relaxed), 1, "{error}");
+        if let Some(undo) = undo {
+            let _ = super::undo(&undo, None, true);
+        }
+    }
+
+    /// What the engine reports when a folder can't be recycled and goes for good after "Delete
+    /// permanently?": items inside it, a failure, the folder again. Each given item counts once.
+    #[test]
+    fn delete_progress_counts_each_given_item_once() {
+        use windows::Win32::UI::Shell::{
+            COPYENGINE_S_DONT_PROCESS_CHILDREN, COPYENGINE_S_USER_IGNORED,
+        };
+        let sb = Sandbox::new("top-items");
+        let (a, b) = (sb.0.join("a"), sb.0.join("b"));
+        let top = TopItems::new(&[a.clone(), b.clone()], &[]);
+        assert!(!top.first_finish(&a.join("node_modules")));
+        assert!(top.first_finish(&arke_core::path::verbatim(&a)));
+        assert!(!top.first_finish(&a));
+        assert!(top.first_finish(&PathBuf::from(b.to_string_lossy().to_uppercase())));
+        assert!(!top.first_finish(&sb.0.join("c")));
+
+        assert!(finished(windows::Win32::Foundation::S_OK));
+        assert!(finished(COPYENGINE_S_DONT_PROCESS_CHILDREN));
+        assert!(finished(
+            windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.to_hresult()
+        ));
+        assert!(!finished(COPYENGINE_S_USER_IGNORED));
+        assert!(!finished(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult()
+        ));
     }
 
     fn failures_of(result: &Result<OpOutcome, ShellError>) -> Vec<(String, FailReason)> {
@@ -2488,5 +2768,185 @@ mod drag_tests {
             "network paths stay plain"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The formats an object offers, in its own order, as (format, storage media).
+    fn formats(object: &windows::Win32::System::Com::IDataObject) -> Vec<(u16, u32)> {
+        use windows::Win32::System::Com::DATADIR_GET;
+        let mut found = Vec::new();
+        // SAFETY: the enumerator fills one FORMATETC at a time into a valid buffer.
+        unsafe {
+            let list = object.EnumFormatEtc(DATADIR_GET.0.cast_unsigned()).unwrap();
+            loop {
+                let mut one = [FORMATETC::default()];
+                let mut got = 0u32;
+                if list.Next(&mut one, Some(&raw mut got)).is_err() || got == 0 {
+                    break;
+                }
+                found.push((one[0].cfFormat, one[0].tymed));
+            }
+        }
+        found
+    }
+
+    /// The bytes of one format, `None` when it can't be read.
+    fn bytes(object: &windows::Win32::System::Com::IDataObject, cf: u16) -> Option<Vec<u8>> {
+        // SAFETY: the HGLOBAL is only read while locked, within its size, then released.
+        unsafe {
+            let mut medium = object.GetData(&format(cf)).ok()?;
+            let size = windows::Win32::System::Memory::GlobalSize(medium.u.hGlobal);
+            let ptr = GlobalLock(medium.u.hGlobal).cast::<u8>();
+            let read = (!ptr.is_null()).then(|| std::slice::from_raw_parts(ptr, size).to_vec());
+            let _ = GlobalUnlock(medium.u.hGlobal);
+            windows::Win32::System::Ole::ReleaseStgMedium(&raw mut medium);
+            read
+        }
+    }
+
+    /// The data object Explorer drags for `paths` (all in one folder): the folder's own, from
+    /// `IShellFolder::GetUIObjectOf`.
+    fn explorer_object(paths: &[PathBuf]) -> windows::Win32::System::Com::IDataObject {
+        use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+        use windows::Win32::UI::Shell::{
+            ILFindLastID, IShellFolder, SHBindToParent, SHParseDisplayName,
+        };
+        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
+        // SAFETY: names are NUL-terminated; the PIDLs are freed at the end, after the call that
+        // reads the children pointing into them.
+        unsafe {
+            for path in paths {
+                let name = wide(path.as_os_str());
+                let mut pidl = std::ptr::null_mut();
+                SHParseDisplayName(PCWSTR(name.as_ptr()), None, &raw mut pidl, 0, None).unwrap();
+                pidls.push(pidl);
+            }
+            let folder: IShellFolder = SHBindToParent(pidls[0], None).unwrap();
+            let children: Vec<*const ITEMIDLIST> = pidls
+                .iter()
+                .map(|p| ILFindLastID(p.cast_const()).cast_const())
+                .collect();
+            let object = folder
+                .GetUIObjectOf(HWND::default(), &children, None)
+                .unwrap();
+            for pidl in pidls {
+                windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast_const().cast()));
+            }
+            object
+        }
+    }
+
+    /// A Shell IDList Array (CIDA) taken apart: the folder's ID list and each item's, as bytes
+    /// with their terminators.
+    fn cida(bytes: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let list = |mut at: usize| {
+            let start = at;
+            loop {
+                let size = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+                at += size.max(2);
+                if size == 0 {
+                    return bytes[start..at].to_vec();
+                }
+            }
+        };
+        let count = word(0);
+        let items = (1..=count).map(|i| list(word(4 + 4 * i))).collect();
+        (list(word(4)), items)
+    }
+
+    /// The file system path of an ID list, empty when it has none (the desktop).
+    fn path_of(ids: &[u8]) -> String {
+        let mut path = [0u16; 260];
+        // SAFETY: ids is a whole, zero-terminated ID list (ITEMIDLIST is byte-aligned).
+        let _ = unsafe {
+            windows::Win32::UI::Shell::SHGetPathFromIDListW(
+                ids.as_ptr()
+                    .cast::<windows::Win32::UI::Shell::Common::ITEMIDLIST>(),
+                &mut path,
+            )
+        };
+        let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+        String::from_utf16_lossy(&path[..end])
+    }
+
+    /// Chat apps (WeChat) take files dragged from Explorer but not from Arke. Arke's drag of files
+    /// from one folder is now shaped like Explorer's: the same formats in the same order, the same
+    /// bytes for the file list and the first file's name, and shell IDs given as the folder plus
+    /// one-level items, the items byte for byte. Before, they were full IDs under the desktop, a
+    /// shape Explorer never drags. The folder's own ID differs between any two binds (a field
+    /// changes each time, even between two Explorer objects), so it is compared by its path and
+    /// its length.
+    #[test]
+    fn drags_from_one_folder_match_explorers() {
+        let dir = crate::win::long_temp_dir().join(format!("arke-drag-ex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b 報告.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let paths = [a, b];
+        let _com = Com::init().unwrap();
+        let arke = drag_data_object(&paths).unwrap();
+        add_hdrop(&arke, &paths).unwrap();
+        let explorer = explorer_object(&paths);
+        assert_eq!(formats(&arke), formats(&explorer));
+        // SAFETY: registers (or looks up) format names.
+        let (ids, name) = unsafe {
+            (
+                RegisterClipboardFormatW(w!("Shell IDList Array")) as u16,
+                RegisterClipboardFormatW(w!("FileNameW")) as u16,
+            )
+        };
+        for (cf, what) in [(CF_HDROP.0, "CF_HDROP"), (name, "FileNameW")] {
+            let theirs = bytes(&explorer, cf);
+            assert!(theirs.is_some(), "Explorer offers {what}");
+            assert_eq!(bytes(&arke, cf), theirs, "{what}");
+        }
+        let (our_folder, our_items) = cida(&bytes(&arke, ids).unwrap());
+        let (their_folder, their_items) = cida(&bytes(&explorer, ids).unwrap());
+        assert_eq!(our_items, their_items, "items");
+        assert_eq!(path_of(&our_folder), dir.to_string_lossy());
+        assert_eq!(path_of(&our_folder), path_of(&their_folder));
+        assert_eq!(our_folder.len(), their_folder.len(), "folder ID length");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Items from different folders (search results) still go in one object, all of them.
+    #[test]
+    fn drags_from_several_folders_carry_every_id() {
+        let dir = crate::win::long_temp_dir().join(format!("arke-drag-mix-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = dir.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let paths = [a, b];
+        let _com = Com::init().unwrap();
+        let object = drag_data_object(&paths).unwrap();
+        add_hdrop(&object, &paths).unwrap();
+        // SAFETY: registers (or looks up) a format name.
+        let ids = unsafe { RegisterClipboardFormatW(w!("Shell IDList Array")) } as u16;
+        assert_eq!(id_count(&object, ids), Some(2));
+        // SAFETY: the HGLOBAL is read as CF_HDROP and released.
+        unsafe {
+            let mut medium = object.GetData(&format(CF_HDROP.0)).unwrap();
+            assert_eq!(parse_hdrop(HDROP(medium.u.hGlobal.0)), paths);
+            windows::Win32::System::Ole::ReleaseStgMedium(&raw mut medium);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_common_folder_is_found_only_when_all_share_it() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            common_parent(&[p(r"C:\a\x.txt"), p(r"C:\a\y")]),
+            Some(Path::new(r"C:\a"))
+        );
+        assert_eq!(common_parent(&[p(r"C:\a\x.txt"), p(r"C:\b\y")]), None);
+        assert_eq!(common_parent(&[p(r"C:\a\x.txt"), p(r"C:\a\sub\y")]), None);
+        assert_eq!(common_parent(&[p(r"C:\")]), None, "a drive has no folder");
+        assert_eq!(common_parent(&[]), None);
     }
 }

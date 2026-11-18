@@ -55,6 +55,8 @@ pub struct WindowsWindowState {
 
     pub callbacks: Callbacks,
     pub frame_signal: Arc<PlatformFrameSignal>,
+    /// Arke: whether the vsync thread should keep ticking this window (see `frame_gate.rs`).
+    pub(crate) frames: Arc<WindowFrames>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
     pub pending_surrogate: Cell<Option<u16>>,
@@ -79,6 +81,11 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
+    /// Set when a left press in the client area of an inactive window was let through without
+    /// activating it (see `mouse_activate_answer` in `events.rs`). The window is activated
+    /// when that button is released over it; a press that became a drag to another program
+    /// never is.
+    pub activate_on_release: Cell<bool>,
 
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
@@ -124,6 +131,7 @@ impl WindowsWindowState {
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
         draw_coordinator: Rc<DrawCoordinator>,
+        vsync_wake: Arc<VSyncWake>,
     ) -> Result<Self> {
         let scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
@@ -171,6 +179,7 @@ impl WindowsWindowState {
             min_size,
             callbacks,
             frame_signal: Arc::new(PlatformFrameSignal::new()),
+            frames: Arc::new(WindowFrames::new(vsync_wake)),
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
@@ -184,6 +193,7 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            activate_on_release: Cell::new(false),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -282,6 +292,7 @@ impl WindowsWindowInner {
             context.disable_direct_composition,
             context.invalidate_devices.clone(),
             context.draw_coordinator.clone(),
+            context.vsync_wake.clone(),
         )?;
 
         Ok(Rc::new(Self {
@@ -433,6 +444,7 @@ struct WindowCreateContext {
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
+    vsync_wake: Arc<VSyncWake>,
     parent_hwnd: Option<HWND>,
 }
 
@@ -461,6 +473,7 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
             draw_coordinator,
+            vsync_wake,
         } = creation_info;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -546,6 +559,7 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
             draw_coordinator,
+            vsync_wake,
             parent_hwnd,
         };
         let creation_result = unsafe {
@@ -974,6 +988,22 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.request_frame.set(Some(callback));
     }
 
+    // Arke: GPUI calls the frame waker whenever a window needs a frame, so the vsync thread can
+    // stop ticking idle windows (see `frame_gate.rs`).
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frames = Arc::downgrade(&self.state.frames);
+        Some(Rc::new(move || {
+            if let Some(frames) = frames.upgrade() {
+                frames.wake();
+            }
+        }))
+    }
+
+    // GPUI calls this without the frame waker when a window only needs a present.
+    fn schedule_frame(&self) {
+        self.state.frames.wake();
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
         self.state.callbacks.input.set(Some(callback));
     }
@@ -1041,6 +1071,9 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+        // Arke: a window that presented gets one more tick, which serves anything GPUI deferred
+        // meanwhile (a request that came in during a synchronous draw) before it goes idle.
+        self.state.frames.wake();
     }
 
     #[cfg(feature = "test-support")]
@@ -1144,7 +1177,11 @@ impl accesskit::ActionHandler for A11yActionHandler {
 }
 
 #[implement(IDropTarget)]
-struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
+struct WindowsDragDropHandler(
+    pub Rc<WindowsWindowInner>,
+    /// The files as the source listed them when the drag entered.
+    RefCell<SmallVec<[PathBuf; 2]>>,
+);
 
 impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
@@ -1152,6 +1189,35 @@ impl WindowsDragDropHandler {
             func(input);
             self.0.state.callbacks.input.set(Some(func));
         }
+    }
+}
+
+/// The files a data object lists (`CF_HDROP`), or `None` if it lists none.
+unsafe fn dropped_paths(idata_obj: &IDataObject) -> Option<SmallVec<[PathBuf; 2]>> {
+    let config = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut() as _,
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as _,
+    };
+    unsafe {
+        if idata_obj.QueryGetData(&config as _) != S_OK {
+            return None;
+        }
+        let mut idata = idata_obj.GetData(&config as _).log_err()?;
+        if idata.u.hGlobal.is_invalid() {
+            return None;
+        }
+        let hdrop = HDROP(idata.u.hGlobal.0);
+        let mut paths = SmallVec::<[PathBuf; 2]>::new();
+        with_file_names(hdrop, |file_name| {
+            if let Some(path) = PathBuf::from_str(&file_name).log_err() {
+                paths.push(path);
+            }
+        });
+        ReleaseStgMedium(&mut idata);
+        Some(paths)
     }
 }
 
@@ -1166,30 +1232,10 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         unsafe {
             let idata_obj = pdataobj.ok()?;
-            let config = FORMATETC {
-                cfFormat: CF_HDROP.0,
-                ptd: std::ptr::null_mut() as _,
-                dwAspect: DVASPECT_CONTENT.0,
-                lindex: -1,
-                tymed: TYMED_HGLOBAL.0 as _,
-            };
             let cursor_position = POINT { x: pt.x, y: pt.y };
-            if idata_obj.QueryGetData(&config as _) == S_OK {
+            if let Some(paths) = dropped_paths(idata_obj) {
                 *pdweffect = DROPEFFECT_COPY;
-                let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
-                    return Ok(());
-                };
-                if idata.u.hGlobal.is_invalid() {
-                    return Ok(());
-                }
-                let hdrop = HDROP(idata.u.hGlobal.0);
-                let mut paths = SmallVec::<[PathBuf; 2]>::new();
-                with_file_names(hdrop, |file_name| {
-                    if let Some(path) = PathBuf::from_str(&file_name).log_err() {
-                        paths.push(path);
-                    }
-                });
-                ReleaseStgMedium(&mut idata);
+                *self.1.borrow_mut() = paths.clone();
                 let mut cursor_position = cursor_position;
                 ScreenToClient(self.0.hwnd, &mut cursor_position)
                     .ok()
@@ -1275,13 +1321,27 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 .log_err();
         }
         let scale_factor = self.0.state.scale_factor.get();
-        let input = PlatformInput::FileDrop(FileDropEvent::Submit {
-            position: logical_point(
-                cursor_position.x as f32,
-                cursor_position.y as f32,
-                scale_factor,
-            ),
-        });
+        let position = logical_point(
+            cursor_position.x as f32,
+            cursor_position.y as f32,
+            scale_factor,
+        );
+        // Ask for the files again: some sources only make them now. An archive manager (7-Zip,
+        // NanaZip) lists placeholder paths while the drag is under way, extracts to a temp folder
+        // when asked after the button is released, and deletes that folder once the drop
+        // returns. When the list changed, the drag is entered again with it, so the drop sees
+        // the real files (and can take them before this returns).
+        if let Some(paths) = unsafe { dropped_paths(idata_obj) }
+            && *self.1.borrow() != paths
+        {
+            *self.1.borrow_mut() = paths.clone();
+            self.handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::Exited));
+            self.handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::Entered {
+                position,
+                paths: ExternalPaths(paths),
+            }));
+        }
+        let input = PlatformInput::FileDrop(FileDropEvent::Submit { position });
         self.handle_drag_drop(input);
 
         Ok(())
@@ -1517,7 +1577,7 @@ fn get_module_handle() -> HMODULE {
 
 fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
     let window_handle = window.hwnd;
-    let handler = WindowsDragDropHandler(window.clone());
+    let handler = WindowsDragDropHandler(window.clone(), RefCell::default());
     // The lifetime of `IDropTarget` is handled by Windows, it won't release until
     // we call `RevokeDragDrop`.
     // So, it's safe to drop it here.

@@ -1,5 +1,6 @@
 //! List display preferences (Sort and view settings): short or full dates, visible columns, their
-//! widths and their order, and the width the preview pane was dragged to.
+//! widths and their order, the width the preview pane was dragged to, and the column view's
+//! column widths.
 //!
 //! App-wide like theme and accent: changes are stored here and all windows redraw (`theme::look`
 //! bumps). Rows read from here while drawing, so tabs don't each keep a copy.
@@ -51,6 +52,8 @@ static WIDTHS: [AtomicU32; Col::ALL.len()] = [const { AtomicU32::new(0) }; Col::
 static PREVIEW_W: AtomicU32 = AtomicU32::new(0);
 /// Sidebar width in pixels (0: the default).
 static SIDEBAR_W: AtomicU32 = AtomicU32::new(0);
+/// Column view widths (px, 0 = default), in [`ViewColumn`] order.
+static VIEW_COLUMN_W: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 /// The columns after Name, left to right.
 static ORDER: RwLock<[Col; Col::MOVABLE.len()]> = RwLock::new(Col::MOVABLE);
 
@@ -296,6 +299,43 @@ pub(crate) fn stored_preview_width() -> Option<u16> {
         .filter(|&w| w != 0)
 }
 
+/// The column view's resizable columns (the third one, the preview, takes what they leave).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewColumn {
+    Parent,
+    Current,
+}
+
+/// Width the user gave a column view column (`None`: its default).
+pub(crate) fn view_column_width(col: ViewColumn) -> Option<Pixels> {
+    match VIEW_COLUMN_W[col as usize].load(Ordering::Relaxed) {
+        0 => None,
+        w => Some(px(w as f32)),
+    }
+}
+
+/// Set a column view width while dragging or fitting (the caller clamps it); redraws all windows
+/// on change. Saving is up to the caller.
+pub(crate) fn set_view_column_width(col: ViewColumn, width: Option<Pixels>) {
+    let value = width.map_or(0, |w| f32::from(w).round().max(1.) as u32);
+    if VIEW_COLUMN_W[col as usize].swap(value, Ordering::Relaxed) != value {
+        theme::touch();
+    }
+}
+
+/// Current column view widths for saving.
+pub(crate) fn stored_view_column_widths() -> crate::settings::ColumnViewWidths {
+    let get = |col: ViewColumn| {
+        u16::try_from(VIEW_COLUMN_W[col as usize].load(Ordering::Relaxed))
+            .ok()
+            .filter(|&w| w != 0)
+    };
+    crate::settings::ColumnViewWidths {
+        parent: get(ViewColumn::Parent),
+        current: get(ViewColumn::Current),
+    }
+}
+
 /// The columns after Name, left to right (shown or not).
 pub(crate) fn order() -> [Col; Col::MOVABLE.len()] {
     *ORDER.read()
@@ -390,6 +430,14 @@ pub(crate) fn apply(settings: &Settings) {
         f32::from(px(f32::from(w)).clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX)) as u32
     });
     changed |= SIDEBAR_W.swap(sidebar, Ordering::Relaxed) != sidebar;
+    let view_columns = settings.column_view_widths;
+    for (col, width) in [
+        (ViewColumn::Parent, view_columns.parent),
+        (ViewColumn::Current, view_columns.current),
+    ] {
+        let value = width.map_or(0, u32::from);
+        changed |= VIEW_COLUMN_W[col as usize].swap(value, Ordering::Relaxed) != value;
+    }
     let order = parse_order(&settings.column_order);
     if *ORDER.read() != order {
         *ORDER.write() = order;

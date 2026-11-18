@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "arke-app"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "arke-core",
  "arke-indexd",
@@ -320,11 +320,13 @@ dependencies = [
 
 [[package]]
 name = "arke-core"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "flate2",
  "flume",
+ "hashbrown 0.16.1",
  "image",
+ "jpeg-decoder",
  "log",
  "lopdf",
  "memmap2",
@@ -332,7 +334,8 @@ dependencies = [
  "nucleo",
  "parking_lot 0.13.0",
  "pulldown-cmark",
- "quick-xml",
+ "quick-xml 0.42.0",
+ "rayon-core",
  "rust-i18n",
  "serde",
  "serde_json",
@@ -345,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "arke-indexd"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "arke-core",
  "env_logger",
@@ -358,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "arke-remote"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "arke-core",
  "base64",
@@ -2426,14 +2429,14 @@ dependencies = [
 
 [[package]]
 name = "genfiles"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "image",
 ]
 
 [[package]]
 name = "genicon"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "ico",
  "resvg 0.49.0",
@@ -3661,6 +3664,12 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
 
 [[package]]
 name = "js-sys"
@@ -5488,6 +5497,15 @@ name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
 ]
@@ -8401,7 +8419,7 @@ checksum = "a6c2ad15e0e922856ee89afe862b8992334bbe7953adad56cd1199358cb30566"
 dependencies = [
  "bitflags 2.13.2",
  "libc",
- "quick-xml",
+ "quick-xml 0.41.0",
  "x11",
 ]
 
@@ -8419,7 +8437,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.5.4"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "serde_json",

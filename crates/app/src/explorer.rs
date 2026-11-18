@@ -87,7 +87,7 @@ mod viewopts;
 
 pub(crate) use dnd::{
     DragPreview, DraggedFiles, DraggingOutside, PendingDragOut, RightDrag, ShelfDrag, accepts_drop,
-    drop_external_into, drop_into, report_drop_target,
+    drop_external_into, drop_into, hold_temp_drop, report_drop_target,
 };
 pub(crate) use icons::IconSize;
 pub(crate) use layout::{SharedPreview, shared_preview};
@@ -164,6 +164,10 @@ actions!(
         FocusOtherPane,
         /// Ctrl+Shift+A: put the selection on the shelf.
         AddToShelf,
+        /// Ctrl+= / Ctrl+- / Ctrl+0 in Quick Look: zoom the preview in, out, back to normal.
+        LookZoomIn,
+        LookZoomOut,
+        LookZoomReset,
     ]
 );
 
@@ -205,6 +209,10 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-m", MoveToPeer, list),
         KeyBinding::new("tab", FocusOtherPane, list),
         KeyBinding::new("shift-tab", FocusOtherPane, list),
+        // Only while Quick Look is open; otherwise they pass on.
+        KeyBinding::new("ctrl-=", LookZoomIn, list),
+        KeyBinding::new("ctrl--", LookZoomOut, list),
+        KeyBinding::new("ctrl-0", LookZoomReset, list),
         // Down in the filter box moves focus to the list.
         KeyBinding::new("down", SelectNext, filter),
         KeyBinding::new("alt-up", GoUp, root),
@@ -327,6 +335,13 @@ pub(crate) enum AppEvent {
         generation: u64,
         data: preview::PreviewData,
     },
+    /// A page rendered for the preview pane's page list
+    PanePdfPage(preview::RenderedPage),
+    /// Creation time of the previewed item, read when its entry came without one (search hits).
+    PreviewCreated {
+        generation: u64,
+        created: std::time::SystemTime,
+    },
     /// High-resolution image for Quick Look's actual-size mode.
     ZoomImage {
         generation: u64,
@@ -361,11 +376,8 @@ pub(crate) enum AppEvent {
         version: u64,
         scan: crate::shell::CloudScan,
     },
-    /// "Show more options" menu is ready.
-    ShellMenu {
-        request: u64,
-        result: Result<crate::shell::ShellMenu, crate::shell::ShellError>,
-    },
+    /// The Windows context menu ("Show more options" and pinned commands).
+    ShellMenu(menu::ShellMenuEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -519,6 +531,50 @@ pub(crate) struct Metrics {
     pub(crate) first_frame: Option<Duration>,
     pub(crate) first_listing: Option<Duration>,
     listing_ready: bool,
+    /// What this pane's first frame and listing are logged as, if anything.
+    pub(crate) clock: StartClock,
+    /// First frame, timed by `clock`.
+    pub(crate) clock_first_frame: Option<Duration>,
+}
+
+/// How a pane's first frame and first full listing are logged. A window hands its timing to the
+/// pane it shows in its first frame (`Workspace::render`); every other pane is untimed, since it
+/// may first be drawn hours later (a restored tab, a folder under Home).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartClock {
+    #[default]
+    Untimed,
+    /// The window the process started with: a cold start, from process start.
+    Cold(Instant),
+    /// A window the resident process opened when asked: from when the request arrived.
+    Request(Instant),
+}
+
+impl StartClock {
+    /// A new window's: a cold start if it is the window the process started with.
+    pub(crate) fn for_window(started_at: Instant) -> Self {
+        if claim_cold_start(started_at) {
+            Self::Cold(started_at)
+        } else {
+            Self::Untimed
+        }
+    }
+}
+
+/// When the process started (set by `main`, except for a launch in the background, which opens
+/// no window). The window created with exactly this time is the first one; any other window (one
+/// a resident Arke opens hours later) would log hours as a "cold start".
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+pub(crate) fn mark_process_start(at: Instant) {
+    let _ = PROCESS_START.set(at);
+}
+
+/// Whether a window created with `started_at` logs the cold-start timings; true at most once.
+pub(crate) fn claim_cold_start(started_at: Instant) -> bool {
+    static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    PROCESS_START.get() == Some(&started_at)
+        && !CLAIMED.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Inputs a filter result depends on: directory, content version, sort, query. Any change means
@@ -582,6 +638,10 @@ pub(crate) struct Explorer {
     pub(crate) preview_resized: bool,
     /// Pressed on the preview pane's edge: where (x), and the pane's width then.
     preview_drag_start: Option<(Pixels, Pixels)>,
+    /// A column view column was dragged but its width is not saved yet (saved on release).
+    pub(crate) view_column_resized: Option<crate::prefs::ViewColumn>,
+    /// Pressed on a column view divider: which column, where (x), and the column's width then.
+    view_column_drag: Option<(crate::prefs::ViewColumn, Pixels, Pixels)>,
     /// Where the symlinks and junctions in this folder point (Link target column).
     link_targets: details::LinkTargets,
     /// Alt-drop with the menu still open: files to drop and destination.
@@ -754,8 +814,13 @@ pub(crate) struct Explorer {
     /// Press inside a multi-selection: keep the selection (it may be dragged) and narrow to this
     /// item on release if no drag happened.
     click_select: Option<usize>,
-    /// Slow click to rename (click the only selected item, then wait; see `arke_core::slow_click`).
-    slow_click: arke_core::slow_click::SlowClick<Arc<str>>,
+    /// The last press landed on this item's name (set by the name, read by the item's handler,
+    /// which runs after it).
+    name_pressed: Option<usize>,
+    /// A press on the name of the only selected item (#89): released without a second click, it
+    /// renames once the double-click time has passed, like Explorer.
+    rename_press: Option<Arc<str>>,
+    rename_wait: Option<Task<()>>,
     /// List density (settings, shared by all tabs).
     pub(crate) density: Density,
     /// Item size in the Details view (settings, shared by all tabs).
@@ -799,6 +864,11 @@ pub(crate) struct Explorer {
     /// Sideways scroll the header was drawn at in this render (`None`: no header), to redraw it
     /// if the list clamps its own.
     header_x: std::cell::Cell<Option<Pixels>>,
+    /// Height the side preview's frame got at the last layout (less than asked for in a short
+    /// window), so a PDF's pages fit what is shown.
+    pane_frame_h: std::rc::Rc<std::cell::Cell<Option<Pixels>>>,
+    /// The side preview's details, which scroll (with a scrollbar) in a window too short for them.
+    pane_info_scroll: (gpui::ScrollHandle, crate::scrollbar::ScrollbarDrag),
     /// Full pane width including the preview pane. The top bar and context bar span it, so it
     /// decides which buttons collapse.
     pub(crate) bar_width: Pixels,
@@ -816,8 +886,8 @@ pub(crate) struct Explorer {
     /// Scroll position and scrollbar for scrollable content in the preview pane and Quick Look
     /// (text, folders, archives).
     pub(crate) preview_scroll: gpui::ScrollHandle,
-    /// Where the progress ring is drawn now; eases toward the real progress.
-    pub(crate) ring_shown: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Where the progress ring is drawn now (eases toward the real progress), and its next frame.
+    pub(crate) ring: std::rc::Rc<op_view::RingState>,
     pub(crate) preview_scrollbar: crate::scrollbar::ScrollbarDrag,
     /// Folder preview: subfolders expanded in place in its list (`None`: still loading), for the
     /// folder in `preview_open_root`.
@@ -848,6 +918,8 @@ pub(crate) struct Explorer {
     bench: Option<Bench>,
     loading_task: Option<Task<()>>,
     sort_task: Option<Task<()>>,
+    /// Watcher changes too many for the UI thread in a large folder, merged in the background
+    delta_merge: Option<DeltaMerge>,
     _event_loop: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -861,6 +933,14 @@ pub(crate) fn short_path(path: &Path) -> String {
     }
     let tail: PathBuf = parts[parts.len() - 2..].iter().collect();
     format!("…{}{}", std::path::MAIN_SEPARATOR, tail.display())
+}
+
+/// Watcher changes being merged in the background ([`Explorer::merge_in_background`]).
+struct DeltaMerge {
+    generation: Gen,
+    /// Changes that arrived since, applied after the merge.
+    backlog: Vec<arke_core::Delta>,
+    _task: Task<()>,
 }
 
 pub(crate) fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) {
@@ -953,6 +1033,8 @@ impl Explorer {
             column_resized: false,
             preview_resized: false,
             preview_drag_start: None,
+            view_column_resized: None,
+            view_column_drag: None,
             link_targets: details::LinkTargets::default(),
             pending_drop: None,
             right_press: None,
@@ -1051,7 +1133,9 @@ impl Explorer {
             pane: PaneInfo::default(),
             compare: None,
             click_select: None,
-            slow_click: arke_core::slow_click::SlowClick::default(),
+            name_pressed: None,
+            rename_press: None,
+            rename_wait: None,
             density: settings.read(cx).settings.density,
             details_size: settings.read(cx).settings.details_size,
             preview_pane: settings.read(cx).settings.preview_pane,
@@ -1074,6 +1158,8 @@ impl Explorer {
             fit: layout::Fit::default(),
             cols: None,
             header_x: std::cell::Cell::new(None),
+            pane_frame_h: std::rc::Rc::default(),
+            pane_info_scroll: Default::default(),
             bar_width: px(1000.),
             paper_width: px(1000.),
             show_loading: false,
@@ -1082,7 +1168,7 @@ impl Explorer {
             scrollbar_drag: crate::scrollbar::ScrollbarDrag::default(),
             hscrollbar_drag: crate::scrollbar::ScrollbarDrag::default(),
             preview_scroll: gpui::ScrollHandle::new(),
-            ring_shown: std::rc::Rc::default(),
+            ring: std::rc::Rc::default(),
             preview_scrollbar: crate::scrollbar::ScrollbarDrag::default(),
             preview_open: HashMap::new(),
             preview_open_root: None,
@@ -1102,6 +1188,7 @@ impl Explorer {
             bench,
             loading_task: None,
             sort_task: None,
+            delta_merge: None,
             _event_loop: event_loop,
             _subscriptions: subscriptions,
         };
@@ -1620,6 +1707,11 @@ impl Explorer {
                 self.handle_extract_done(result, folder, cx);
             }
             AppEvent::Preview { generation, data } => self.handle_preview(generation, data, cx),
+            AppEvent::PanePdfPage(page) => self.handle_pane_pdf_page(page, cx),
+            AppEvent::PreviewCreated {
+                generation,
+                created,
+            } => self.handle_preview_created(generation, created, cx),
             AppEvent::ZoomImage { generation, image } => {
                 self.handle_zoom_image(generation, image, cx);
             }
@@ -1634,7 +1726,7 @@ impl Explorer {
             AppEvent::LinkTargets { generation, found } => {
                 self.handle_link_targets(generation, found, cx);
             }
-            AppEvent::ShellMenu { request, result } => self.handle_shell_menu(request, result, cx),
+            AppEvent::ShellMenu(event) => self.handle_shell_menu_event(event, cx),
             AppEvent::Tree { node, rel, event } => self.handle_tree_io(node, &rel, event, cx),
         }
     }
@@ -1698,12 +1790,16 @@ impl Explorer {
                 self.list_failed(path, error, kind, cx);
             }
             IoEvent::Delta { generation, delta } if generation == current => {
+                self.folder_contents_changed(cx);
                 self.apply_folder_delta(generation, delta, cx);
             }
             IoEvent::IsFile { generation, path } if generation == current => {
                 self.arrived_at_file(path, cx);
             }
-            IoEvent::NeedsRescan { generation } if generation == current => self.reload(cx),
+            IoEvent::NeedsRescan { generation } if generation == current => {
+                self.folder_contents_changed(cx);
+                self.reload(cx);
+            }
             // Stale results are dropped.
             _ => {}
         }
@@ -1716,11 +1812,24 @@ impl Explorer {
         delta: arke_core::Delta,
         cx: &mut Context<Self>,
     ) {
+        // A merge is running: this one follows it, in order.
+        if let Some(merge) = self
+            .delta_merge
+            .as_mut()
+            .filter(|m| m.generation == generation)
+        {
+            merge.backlog.push(delta);
+            return;
+        }
         // With folders expanded, rows above the screen may come and go: keep the view.
         let anchor = self.scroll_anchor(None);
         let Some(model) = self.model.as_mut().filter(|m| m.generation == generation) else {
             return;
         };
+        if model.delta_too_big(&delta) {
+            self.merge_in_background(generation, delta, cx);
+            return;
+        }
         let removed = delta.removed.clone();
         if model.apply_delta(delta) == DeltaOutcome::NeedsRescan {
             self.reload(cx);
@@ -1729,6 +1838,65 @@ impl Explorer {
         self.selection.remove_names(&removed);
         self.after_content_change(cx);
         self.restore_scroll_anchor(anchor);
+    }
+
+    /// A large folder got more changes than the UI thread applies in a frame: merge them into a
+    /// copy of the list on the background executor (one pass, O(n + k log k)) and swap it in,
+    /// instead of listing the whole folder again. Changes arriving meanwhile wait their turn.
+    fn merge_in_background(
+        &mut self,
+        generation: Gen,
+        delta: arke_core::Delta,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.model.as_ref().filter(|m| m.generation == generation) else {
+            return;
+        };
+        let entries = Arc::clone(&model.entries);
+        let (spec, version) = (model.sorted_by, model.version);
+        let removed = delta.removed.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let merged = cx
+                .background_executor()
+                .spawn(async move { arke_core::model::merged(&entries, &delta, spec) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_merge(generation, version, merged, &removed, cx);
+            });
+        });
+        self.delta_merge = Some(DeltaMerge {
+            generation,
+            backlog: Vec::new(),
+            _task: task,
+        });
+    }
+
+    fn finish_merge(
+        &mut self,
+        generation: Gen,
+        version: u64,
+        merged: Vec<Entry>,
+        removed: &[Arc<str>],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(merge) = self.delta_merge.take_if(|m| m.generation == generation) else {
+            return;
+        };
+        let anchor = self.scroll_anchor(None);
+        let Some(model) = self.model.as_mut().filter(|m| m.generation == generation) else {
+            return;
+        };
+        // The list changed meanwhile (a re-sort finished): list it again, as before.
+        if !model.replace_merged(version, merged) {
+            self.reload(cx);
+            return;
+        }
+        self.selection.remove_names(removed);
+        self.after_content_change(cx);
+        self.restore_scroll_anchor(anchor);
+        for delta in merge.backlog {
+            self.apply_folder_delta(generation, delta, cx);
+        }
     }
 
     /// The folder asked for can't be listed: stay put and say why (or show the error page).
@@ -2946,9 +3114,9 @@ impl Explorer {
         }
     }
 
-    /// Opens with the default app. ShellExecuteExW loads third-party shell extensions, so it runs
-    /// on a
-    /// dedicated STA thread. Shortcuts (`.lnk`) to folders open in Arke instead of Explorer.
+    /// Opens with the default app, in this view's sort order (Photos steps through the folder in
+    /// it). ShellExecuteExW loads third-party shell extensions, so it runs on a dedicated STA
+    /// thread. Shortcuts (`.lnk`) to folders open in Arke instead of Explorer.
     fn open_file(&self, path: PathBuf, cx: &mut App) {
         // Opened files rank first among same-name results in "This PC" search.
         crate::search_history::SearchHistory::record(&path, false, cx);
@@ -2957,12 +3125,13 @@ impl Explorer {
         let shortcut = path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+        let sort = self.sort;
         spawn_thread("shell-open", move || {
             if shortcut && let Some((target, true)) = shell.shortcut_target(&path) {
                 let _ = tx.send(AppEvent::OpenFolder(target));
                 return;
             }
-            if let Err(error) = shell.open(&path) {
+            if let Err(error) = shell.open(&path, Some(sort)) {
                 let _ = tx.send(AppEvent::OpenFailed { path, error });
             }
         });
@@ -2975,11 +3144,30 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let had_focus = self.list_focus.is_focused(window);
+        let list_was_focused = self.list_focus.is_focused(window);
+        let on_name = self.name_pressed.take() == Some(ix);
         window.focus(&self.list_focus, cx);
         self.row_pressed = true;
         let m = event.modifiers;
-        self.slow_click_press(ix, event, had_focus);
+        self.rename_wait = None;
+        self.rename_press = None;
+        // Explorer's slow second click: the item was already the only selection, the list
+        // already had focus (the click isn't the one bringing Arke or the list back), and the
+        // press is on the name.
+        if on_name
+            && list_was_focused
+            && event.click_count == 1
+            && !event.first_mouse
+            && !(m.control || m.shift || m.alt || m.platform)
+            && !self.search_mode
+            && self.renaming.is_none()
+            && !crate::prefs::single_click()
+            && self.selection.len() == 1
+            && let Some(entry) = self.view().and_then(|v| v.get(ix).cloned())
+            && self.selection.contains(&entry.name)
+        {
+            self.rename_press = Some(entry.name);
+        }
         if self.search_mode {
             self.search_cursor = Some(ix);
         } else if let Some(view) = self.view() {
@@ -3009,84 +3197,53 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Left press on a row: arm slow-click rename when this is a plain single click on what was
-    /// already the only selected item (before this press changes the selection).
-    fn slow_click_press(&mut self, ix: usize, event: &MouseDownEvent, had_focus: bool) {
-        let m = event.modifiers;
-        let name = if self.search_mode {
-            None
-        } else {
-            self.view()
-                .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
-        };
-        let Some(name) = name else {
-            self.slow_click.cancel();
-            return;
-        };
-        let press = arke_core::slow_click::Press {
-            click_count: event.click_count,
-            modifiers: m.control || m.shift || m.alt || m.platform,
-            was_sole_selection: self.selection.len() == 1 && self.selection.contains(&name),
-            had_focus,
-            blocked: crate::prefs::single_click() || self.renaming.is_some(),
-        };
-        self.slow_click.press(name, press);
-    }
-
-    /// Click (release without a drag) on a row: start the slow-click wait, the system
-    /// double-click time, and rename if nothing cancels it meanwhile.
-    pub(super) fn slow_click_release(
+    /// The press on the selected item's name was released without a drag: rename once the
+    /// double-click time has passed with no other click or key (#89).
+    pub(super) fn on_row_released(
         &mut self,
         ix: usize,
+        event: &gpui::ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(name) = self
-            .view()
-            .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
-        else {
-            self.slow_click.cancel();
+        let Some(name) = self.rename_press.take() else {
             return;
         };
-        let delay = crate::win::rename_click_delay();
-        let Some(ticket) = self.slow_click.release(&name, Instant::now(), delay) else {
+        if event.click_count() != 1
+            || self
+                .view()
+                .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
+                .is_none_or(|n| n != name)
+        {
             return;
-        };
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(delay).await;
+        }
+        let wait = crate::win::double_click_time();
+        self.rename_wait = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(wait).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let focused = this.list_focus.is_focused(window);
-                let selection = &this.selection;
-                let renaming = this.renaming.is_some();
-                let fired = this.slow_click.fire(ticket, Instant::now(), |name| {
-                    focused && !renaming && selection.len() == 1 && selection.contains(name)
-                });
-                if let Some(name) = fired {
+                this.rename_wait = None;
+                // Search results can't be renamed; a search may have started meanwhile.
+                if this.renaming.is_none()
+                    && !this.search_mode
+                    && this.list_focus.is_focused(window)
+                    && this.selection.len() == 1
+                    && this.selection.contains(&name)
+                {
                     this.start_rename(name, window, cx);
-                    cx.notify();
                 }
             });
-        })
-        .detach();
+        }));
     }
 
-    /// The pointer left a row: a pending slow-click rename for it is off.
-    pub(super) fn slow_click_leave(&mut self, ix: usize) {
-        if !self.slow_click.is_armed() {
-            return;
-        }
-        match self
-            .view()
-            .and_then(|v| v.get(ix).map(|e| Arc::clone(&e.name)))
-        {
-            Some(name) => self.slow_click.leave(&name),
-            None => self.slow_click.cancel(),
-        }
+    /// A right click or a scroll: no click-to-rename.
+    pub(super) fn cancel_click_rename(&mut self) {
+        self.rename_wait = None;
+        self.rename_press = None;
     }
 
-    /// A key, a right click, a scroll or a drag: no slow-click rename.
-    pub(super) fn slow_click_cancel(&mut self) {
-        self.slow_click.cancel();
+    /// Records a press on an item's name; the item's own press handler runs next.
+    pub(super) const fn on_name_pressed(&mut self, ix: usize) {
+        self.name_pressed = Some(ix);
     }
 
     /// Single-click mode: opens on release if there was no drag and no Ctrl/Shift. Returns whether
@@ -3133,6 +3290,8 @@ impl Explorer {
         if !self.list_focus.is_focused(window) {
             return;
         }
+        // A key between the clicks and the rename: no rename (#89).
+        self.rename_wait = None;
         let ks = &event.keystroke;
         if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
             return;
@@ -3144,7 +3303,7 @@ impl Explorer {
             return;
         }
         if text == " " && !self.typeahead.is_typing(Instant::now()) {
-            self.toggle_quick_look(cx);
+            self.space_preview(cx);
             cx.stop_propagation();
             return;
         }
@@ -3296,6 +3455,13 @@ impl Explorer {
 
     // ───────────────────────── Per frame ─────────────────────────
 
+    /// Takes the window's start timing: this pane is the one its first frame shows.
+    pub(crate) const fn time_start(&mut self, clock: StartClock) {
+        if self.metrics.first_frame.is_none() {
+            self.metrics.clock = clock;
+        }
+    }
+
     fn on_frame(&mut self, window: &mut Window, cx: &App) {
         let title = match self.display_path() {
             Some(_) => format!("{} - Arke", self.tab_title()),
@@ -3307,21 +3473,33 @@ impl Explorer {
         }
 
         let since_start = self.started_at.elapsed();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
         if self.metrics.first_frame.is_none() {
             self.metrics.first_frame = Some(since_start);
-            log::info!(
-                "cold start: first frame {:.1} ms",
-                since_start.as_secs_f64() * 1e3
-            );
+            if let StartClock::Cold(at) | StartClock::Request(at) = self.metrics.clock {
+                self.metrics.clock_first_frame = Some(at.elapsed());
+            }
+            if let StartClock::Cold(at) = self.metrics.clock {
+                log::info!("cold start: first frame {:.1} ms", ms(at.elapsed()));
+            }
         }
         let listing_ready = self.metrics.listing_ready && self.metrics.first_listing.is_none();
         if listing_ready {
             self.metrics.first_listing = Some(since_start);
-            log::info!(
-                "cold start: first full listing {:.1} ms ({} items)",
-                since_start.as_secs_f64() * 1e3,
-                self.entry_count()
-            );
+            match self.metrics.clock {
+                StartClock::Cold(at) => log::info!(
+                    "cold start: first full listing {:.1} ms ({} items)",
+                    ms(at.elapsed()),
+                    self.entry_count()
+                ),
+                StartClock::Request(at) => log::info!(
+                    "opened on request: first frame {:.1} ms, first full listing {:.1} ms ({} items)",
+                    self.metrics.clock_first_frame.map_or(-1.0, ms),
+                    ms(at.elapsed()),
+                    self.entry_count()
+                ),
+                StartClock::Untimed => {}
+            }
         }
 
         // Scroll metrics count rows; a grid row holds several items.

@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_ICONONLY,
+    SIIGBF_RESIZETOFIT,
     SIIGBF_THUMBNAILONLY,
 };
 use windows::core::PCWSTR;
@@ -63,6 +64,37 @@ fn shell_image(path: &Path, size: u32, flags: SIIGBF) -> Option<Thumbnail> {
     let edge = i32::try_from(size).ok()?;
     // SAFETY: factory is a valid interface.
     let bitmap = unsafe { factory.GetImage(SIZE { cx: edge, cy: edge }, flags) }.ok()?;
+    let pixels = bitmap_pixels(bitmap);
+    // SAFETY: GetImage hands us ownership of the HBITMAP.
+    let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+    pixels
+}
+
+/// Windows' thumbnail of a file (for videos: a frame), fitted within `size`. `None` if Windows
+/// has none (no thumbnail provider or codec for it). Loads thumbnail providers, which Windows runs
+/// in its own surrogate process; Arke calls this only in its thumbnail host (`thumb_host.rs`).
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "only the host process calls it; tests use a stand-in host"
+    )
+)]
+pub(crate) fn video_thumbnail(path: &Path, size: u32) -> Option<Thumbnail> {
+    let _com = Com::init().ok()?;
+    let w = wide(path.as_os_str());
+    // SAFETY: COM is initialized on this thread; w is NUL-terminated and outlives the call.
+    let factory: IShellItemImageFactory =
+        unsafe { SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None) }.ok()?;
+    let edge = i32::try_from(size).ok()?;
+    // SAFETY: factory is a valid interface; THUMBNAILONLY returns no icon in place of a picture.
+    let bitmap = unsafe {
+        factory.GetImage(
+            SIZE { cx: edge, cy: edge },
+            SIIGBF_THUMBNAILONLY | SIIGBF_RESIZETOFIT,
+        )
+    }
+    .ok()?;
     let pixels = bitmap_pixels(bitmap);
     // SAFETY: GetImage hands us ownership of the HBITMAP.
     let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };

@@ -59,8 +59,8 @@ ArkeX 是 [Koimsurai/Arke](https://github.com/Koimsurai/Arke) 的改版，发布
 
 ### 7. 可拖宽侧栏
 - 是什么：侧栏宽度可拖动（180–420，默认 248），存 `prefs::SIDEBAR_W` / `settings.sidebar_width`。
-- 文件：`workspace_sidebar.rs`、`workspace.rs`、`prefs.rs`、`theme.rs`。
-- 合并：保留。
+- 文件：`workspace_sidebar.rs`、`workspace.rs`、`workspace_rail.rs`、`prefs.rs`、`theme.rs`。
+- 合并：保留。上游 0.6 加了可折叠成图标列（Ctrl+B，`theme::sidebar_width()` 返回 `RAIL_W` 或全宽）：两者合并——展开时宽度取 `prefs::sidebar_width()`（用户拖的宽度），折叠动画、悬停展开也用它；图标列用我们的 Phosphor 侧栏图标（`Icon::sidebar()`）。
 
 ### 8. 自适应图标网格与 Ctrl+滚轮档位
 - 是什么：`explorer_grid.rs` 自适应间距、多行名称、缓存 `GridLayout`；Ctrl+滚轮图标尺寸 48→192 步长 16；继续缩小进入详细信息 S → M → L（见第 12 条）。
@@ -128,11 +128,20 @@ ArkeX 是 [Koimsurai/Arke](https://github.com/Koimsurai/Arke) 的改版，发布
 - 依据：Raymond Chen《How slow do you have to slow-double-click for it to be a rename?》（2008）与《How does Explorer determine the delay…》（2012）：延迟就是双击时间，规则是“选中项上的一次点击，前后双击时间内都没有其他点击”；MS Learn 列表视图 `WM_TIMER` 说明；Finder 的点击改名延迟同样跟随双击速度。
 - 文件：`crates/core/src/slow_click.rs`（纯函数状态机 + 单元测试）、`explorer.rs`（`slow_click_*`）、`explorer_view.rs`、`explorer_menu.rs`、`win.rs`（`rename_click_delay`）。
 - 合并：上游若实现同样功能，比较后择优；没有则保留。
+- **2026-11-18 合并上游 0.6.2：改用上游实现**（上游 #105/#89「再次单击名字重命名」）。理由：同样基于系统双击时间；上游只在点中名字时触发，与资源管理器一致（点行内空白不改名），并处理了首次激活窗口的点击（`first_mouse`）、按键、拖动、搜索结果，且自带完整的 GUI 测试。我们的 `arke_core::slow_click`、`win::rename_click_delay` 已删除；保留的只有右键与滚动时取消（`Explorer::cancel_click_rename`）。
 
 ### 20. 地址栏常驻底色
 - 是什么：原来悬停时变深的底色（`theme::wash()`）改为常驻底色；编辑路径时（纸色 + 焦点线）不变。与搜索框未聚焦底色一致。
 - 文件：`explorer_path.rs`。
 - 合并：保留。
+
+## 合并上游 0.6.2（2026-11-18）的其他取舍
+
+- 缩略图：上游新增视频帧缩略图（独立进程 `thumb_host`，更稳）和压缩内存/磁盘缓存。视频改走上游的进程外通道；其他格式仍走我们的 Shell 缩略图（第 4 条），并接入上游的磁盘缓存。上游“没有主题图标的类型用注册程序图标”在关闭 Windows 类型图标时生效；开启时仍用我们的系统类型图标（第 6 条）。内存解码缓存采用上游更小的预算（16 MB + 48 MB 压缩）。
+- 预览窗格：采用上游的“短窗口时画面让高度、详情可滚动”、多页 PDF 与幻灯片滚动、详情行图标；保留 Atlas 顺序（标题在上）和我们的标题排版、悬停才显示的操作按钮。
+- 路径建议：保留 500 条 + 历史；采用上游“当前文件夹名过长时截断”。
+- 图标视图名称：采用上游的 `tile_label`（点名字重命名需要），保留我们的三行与字号。
+- 上游新增 workflow、README 截图与多语言 README、arm64 构建、发布证明等不引入（第 22 条）。
 
 ## 六、更新器与发布 / fork 设置
 

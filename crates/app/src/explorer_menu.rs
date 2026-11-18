@@ -6,6 +6,9 @@
 //! options" submenu with icons and nested submenus, and a chosen item is sent back to that
 //! process to run. No native Windows menu is ever shown.
 //!
+//! Commands pinned from "Show more options" to the top don't wait for the whole Windows menu:
+//! their extensions are read on their own beside it (`explorer_menu_parts.rs`).
+//!
 //! Extraction runs on a background thread (`arke_core::archive`) with cancellable progress in the
 //! status bar. The extracted folder is selected when done.
 
@@ -36,7 +39,11 @@ use crate::a11y::A11yExt as _;
 use crate::assets::Icon;
 use crate::settings::SettingsStore;
 use crate::shell::{ShellMenu, ShellMenuEntry};
+
+#[path = "explorer_menu_parts.rs"]
+mod parts;
 use crate::theme::{self, UiFont as _};
+pub(crate) use parts::ShellMenuEvent;
 
 actions!(
     explorer,
@@ -69,8 +76,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
 const SUBMENU_DELAY: Duration = Duration::from_millis(180);
 /// Row ids for submenu alignment are `level * LEVEL_STRIDE + row`.
 const LEVEL_STRIDE: usize = 1000;
-/// Menu entrance and exit: slide this far (see `motion.rs`).
-const MENU_SLIDE: f32 = crate::motion::SLIDE;
 static NEXT_MENU: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +115,10 @@ pub(crate) enum MenuCommand {
     Compress,
     /// Move the selection into a new folder.
     MoveToNewFolder,
+    /// Split view: copy the selection to the other pane's folder (Alt+C).
+    CopyToPeer,
+    /// Split view: move the selection to the other pane's folder (Alt+M).
+    MoveToPeer,
     /// Use this image as the Arke background.
     SetBackground,
     /// Import this `.json` as an Arke settings backup.
@@ -148,6 +157,11 @@ pub(crate) enum MenuCommand {
     OpenWith(usize),
     /// Windows menu item read for "Show more options".
     Shell(u32),
+    /// Item of one extension's menu, read on its own for a pinned command (its own session).
+    ShellPart {
+        session: u64,
+        id: u32,
+    },
     /// Cloud files: toggle "Always keep on this device".
     KeepOnDevice,
     /// Windows "Open with" dialog.
@@ -261,8 +275,10 @@ const fn glyph_for(command: MenuCommand) -> Option<Icon> {
         C::Open => Icon::Open,
         C::OpenInNewTab => Icon::TabOpen,
         C::OpenInNewWindow | C::DropShortcut => Icon::External,
-        C::Cut | C::DropMove | C::ClipTargets(true) => Icon::Cut,
-        C::Copy | C::CopyAddress | C::DropCopy | C::ClipTargets(false) => Icon::Copy,
+        C::Cut | C::DropMove | C::ClipTargets(true) | C::MoveToPeer => Icon::Cut,
+        C::Copy | C::CopyAddress | C::DropCopy | C::ClipTargets(false) | C::CopyToPeer => {
+            Icon::Copy
+        }
         C::Paste => Icon::Paste,
         C::Rename | C::EditAddress => Icon::Rename,
         C::Delete | C::ClearHistory => Icon::Trash,
@@ -441,7 +457,9 @@ impl MenuEntry {
 
     /// Converts a Windows menu entry (icons become GPUI images). `parent` holds enclosing submenu
     /// names, for the pin key.
-    fn from_shell(entry: ShellMenuEntry, parent: &[&str]) -> Self {
+    /// `session` is set for an item from one extension's menu (read on its own), which runs in
+    /// that menu rather than the whole Windows menu.
+    fn from_shell_in(entry: ShellMenuEntry, parent: &[&str], session: Option<u64>) -> Self {
         let icon =
             |t: Option<arke_core::thumbs::Thumbnail>| t.and_then(crate::media::to_render_image);
         match entry {
@@ -460,7 +478,10 @@ impl MenuEntry {
                 Self::Item(MenuItem {
                     label: label.into(),
                     shortcut: None,
-                    command: MenuCommand::Shell(id),
+                    command: match session {
+                        Some(session) => MenuCommand::ShellPart { session, id },
+                        None => MenuCommand::Shell(id),
+                    },
                     enabled,
                     icon: icon(i),
                     glyph: None,
@@ -480,7 +501,7 @@ impl MenuEntry {
                 path.push(&label);
                 let children = children
                     .into_iter()
-                    .map(|c| Self::from_shell(c, &path))
+                    .map(|c| Self::from_shell_in(c, &path, session))
                     .collect();
                 Self::Submenu {
                     label: label.into(),
@@ -606,6 +627,10 @@ pub(crate) struct ContextMenu {
     shell_slot: Option<usize>,
     /// Number of pinned Windows commands placed directly above "Show more options".
     pinned_rows: usize,
+    /// Single extensions' menus read for pinned commands, by session, while they are held.
+    parts: Vec<(u64, Vec<MenuEntry>)>,
+    /// Id those were asked for with (the whole menu's request).
+    parts_request: Option<u64>,
     /// Differs per menu open; used as the animation id so only a new menu replays the entrance.
     serial: u64,
     /// Last input was keyboard: when submenu items arrive late, keyboard users get the first item
@@ -637,6 +662,8 @@ impl ContextMenu {
             shell_request: None,
             shell_slot: None,
             pinned_rows: 0,
+            parts: Vec::new(),
+            parts_request: None,
             serial: NEXT_MENU.fetch_add(1, Ordering::Relaxed),
             keyboard: false,
             geometry: Rc::default(),
@@ -678,8 +705,14 @@ impl ContextMenu {
         let start = slot - self.pinned_rows;
         let mut found: Vec<MenuItem> = Vec::new();
         if let Some(MenuEntry::Submenu { children, .. }) = self.entries.get(slot) {
+            // From the whole Windows menu once it's in, until then from the extensions read on
+            // their own.
             for key in pinned {
-                if let Some(item) = find_pinned(children, key) {
+                if let Some(item) = find_pinned(children, key).or_else(|| {
+                    self.parts
+                        .iter()
+                        .find_map(|(_, entries)| find_pinned(entries, key))
+                }) {
                     found.push(item.clone());
                 }
             }
@@ -707,6 +740,22 @@ impl ContextMenu {
         }
         self.shell_slot = Some(new_slot);
         self.pinned_rows = added;
+    }
+
+    /// Test helper: highlight top-level row `ix`, as the keyboard would.
+    #[cfg(test)]
+    pub(crate) const fn highlight_for_test(&mut self, ix: usize) {
+        self.highlighted = Some(ix);
+        self.keyboard = true;
+    }
+
+    /// Test helper: the shortcut shown on the top-level item labeled `label`.
+    #[cfg(test)]
+    pub(crate) fn shortcut_of(&self, label: &str) -> Option<&'static str> {
+        self.entries.iter().find_map(|e| match e {
+            MenuEntry::Item(i) if i.label.as_ref() == label => i.shortcut,
+            _ => None,
+        })
     }
 
     /// Test helper: checked items at the top level.
@@ -814,7 +863,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.slow_click_cancel();
+        self.cancel_click_rename();
         if self.renaming.is_some() {
             return;
         }
@@ -964,6 +1013,9 @@ impl Explorer {
             .position(|e| matches!(e, MenuEntry::Submenu { shell: true, .. }));
         if menu.shell_slot.is_some() && self.services.shell.shell_menu_prefetch() {
             self.request_shell_menu(&mut menu);
+            if let Some(request) = menu.shell_request {
+                self.request_menu_parts(&mut menu, request, cx);
+            }
         }
         self.context_menu = Some(menu);
         cx.notify();
@@ -1169,6 +1221,20 @@ impl Explorer {
                 C::MoveToNewFolder,
             ));
         }
+        // Split view: Alt+C / Alt+M are hard to find from the keyboard alone.
+        if self.pane.peer.is_some() {
+            entries.push(MenuEntry::Separator);
+            entries.push(item(
+                t!("menu.copy_to_other_pane"),
+                Some("Alt+C"),
+                C::CopyToPeer,
+            ));
+            entries.push(item(
+                t!("menu.move_to_other_pane"),
+                Some("Alt+M"),
+                C::MoveToPeer,
+            ));
+        }
         entries.push(MenuEntry::Separator);
         if single && *is_dir {
             entries.push(item(t!("menu.open_new_window"), None, C::OpenInNewWindow));
@@ -1366,13 +1432,22 @@ impl Explorer {
         }
     }
 
-    /// Menu closed without a choice: release the background Windows menu too (fire and forget).
+    /// Menu closed without a choice: release the background Windows menus too (fire and forget).
     fn release_shell_menu(&mut self) {
-        if let Some(session) = self
-            .context_menu
-            .as_mut()
-            .and_then(|m| m.shell_session.take())
-        {
+        self.release_shell_menus_but(None);
+    }
+
+    /// Releases the menu's Windows menus (whole and single extensions) except session `keep`,
+    /// which is about to run a command.
+    fn release_shell_menus_but(&mut self, keep: Option<u64>) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        let mut sessions: Vec<u64> = menu.parts.drain(..).map(|(s, _)| s).collect();
+        if menu.shell_session.is_some_and(|s| Some(s) != keep) {
+            sessions.extend(menu.shell_session.take());
+        }
+        for session in sessions.into_iter().filter(|s| Some(*s) != keep) {
             self.services.shell.release_shell_menu(session);
         }
     }
@@ -1434,9 +1509,12 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         use MenuCommand as C;
-        if !matches!(command, MenuCommand::Shell(_)) {
-            self.release_shell_menu();
-        }
+        let keep = match command {
+            MenuCommand::Shell(_) => self.context_menu.as_ref().and_then(|m| m.shell_session),
+            MenuCommand::ShellPart { session, .. } => Some(session),
+            _ => None,
+        };
+        self.release_shell_menus_but(keep);
         let Some(menu) = self.context_menu.take() else {
             return;
         };
@@ -1552,6 +1630,7 @@ impl Explorer {
             C::OpenTerminal => self.open_terminal(&targets),
             C::Compress => self.start_compress(&targets, cx),
             C::MoveToNewFolder => self.move_into_new_folder(cx),
+            C::CopyToPeer | C::MoveToPeer => self.transfer_to_peer(command == C::MoveToPeer, cx),
             C::OpenInNewWindow => {
                 if let Some((path, true)) = targets.first().cloned() {
                     open_in_new_window(path);
@@ -1575,7 +1654,7 @@ impl Explorer {
                 }
             }
             C::Properties => self.run_shell_verb(&targets, "properties", window),
-            // Windows' own "Open with" dialog, opened in the menu process.
+            // Windows' "Choose another app" dialog, with "Always", as Explorer opens it.
             C::ChooseApp => {
                 if let Some((path, false)) = targets.first().cloned() {
                     self.choose_app(path, window);
@@ -1658,6 +1737,9 @@ impl Explorer {
                 if let Some(session) = menu.shell_session {
                     self.invoke_shell_menu(session, id, menu.position, window);
                 }
+            }
+            C::ShellPart { session, id } => {
+                self.invoke_shell_menu(session, id, menu.position, window);
             }
             C::TogglePin => {
                 let path = match targets.first() {
@@ -2146,22 +2228,19 @@ impl Explorer {
     /// Requests the menu for the selected items, or the folder background menu for empty space.
     fn request_shell_menu(&self, menu: &mut ContextMenu) {
         static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
-        let background = menu.targets.is_empty();
-        let paths: Vec<PathBuf> = if background {
-            self.current_path().map(PathBuf::from).into_iter().collect()
-        } else {
-            menu.targets.iter().map(|(p, _)| p.clone()).collect()
-        };
-        if paths.is_empty() {
+        let Some((paths, background)) = self.menu_paths(menu) else {
             return;
-        }
+        };
         let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
         menu.shell_request = Some(request);
         let shell = Arc::clone(&self.services.shell);
         let tx = self.events_tx.clone();
         spawn_thread("more-options", move || {
             let result = shell.shell_menu(&paths, background);
-            let _ = tx.send(AppEvent::ShellMenu { request, result });
+            let _ = tx.send(AppEvent::ShellMenu(ShellMenuEvent::Whole {
+                request,
+                result,
+            }));
         });
     }
 
@@ -2190,7 +2269,7 @@ impl Explorer {
                 menu.shell_session = Some(shell_menu.session);
                 let entries: Vec<MenuEntry> = without_duplicates(shell_menu.entries, &menu.entries)
                     .into_iter()
-                    .map(|e| MenuEntry::from_shell(e, &[]))
+                    .map(|e| MenuEntry::from_shell_in(e, &[], None))
                     .collect();
                 if entries.is_empty() {
                     vec![placeholder(t!("menu.no_more_options"))]
@@ -2223,6 +2302,9 @@ impl Explorer {
             menu.highlighted = menu.level(1).iter().position(MenuEntry::selectable);
         }
         cx.notify();
+        if let Some(menu) = self.context_menu.as_ref() {
+            self.learn_pin_owners(menu, request, cx);
+        }
     }
 
     /// Runs the item with `verb` (e.g. "properties", "openas") from the classic Windows menu. The
@@ -2272,6 +2354,7 @@ impl Explorer {
                 |s| {
                     if let Some(at) = s.menu_pinned.iter().position(|k| *k == key) {
                         s.menu_pinned.remove(at);
+                        s.menu_pin_owners.remove(&key);
                     } else {
                         s.menu_pinned.push(key);
                     }
@@ -2595,35 +2678,34 @@ impl Explorer {
                 outer,
                 ElementId::Name(format!("menu-{}-leave", menu.serial).into()),
                 0.,
-                -MENU_SLIDE / 2.,
+                0.,
             )
         } else {
             outer
-            .key_context("ContextMenu")
-            .track_focus(&menu.focus)
-            .on_action(cx.listener(Self::menu_up))
-            .on_action(cx.listener(Self::menu_down))
-            .on_action(cx.listener(Self::menu_left))
-            .on_action(cx.listener(Self::menu_right))
-            .on_action(cx.listener(Self::menu_confirm))
-            .on_action(cx.listener(Self::menu_dismiss))
-            .on_mouse_down_out(cx.listener(move |this, e: &MouseDownEvent, window, cx| {
-                let inside = geometry
-                    .borrow()
-                    .panels
-                    .iter()
-                    .any(|(&level, b)| level > 0 && b.contains(&e.position));
-                if !inside {
-                    this.close_menu(window, cx);
-                }
-            }))
-            // Slide down and fade in.
-            .with_animation(
-                ElementId::Name(format!("menu-{}", menu.serial).into()),
-                crate::motion::enter(),
-                |panel, t| crate::motion::slide_in(panel, t, 0., -MENU_SLIDE),
-            )
-            .into_any_element()
+                .key_context("ContextMenu")
+                .track_focus(&menu.focus)
+                .on_action(cx.listener(Self::menu_up))
+                .on_action(cx.listener(Self::menu_down))
+                .on_action(cx.listener(Self::menu_left))
+                .on_action(cx.listener(Self::menu_right))
+                .on_action(cx.listener(Self::menu_confirm))
+                .on_action(cx.listener(Self::menu_dismiss))
+                .on_mouse_down_out(cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    let inside = geometry
+                        .borrow()
+                        .panels
+                        .iter()
+                        .any(|(&level, b)| level > 0 && b.contains(&e.position));
+                    if !inside {
+                        this.close_menu(window, cx);
+                    }
+                }))
+                .with_animation(
+                    ElementId::Name(format!("menu-{}", menu.serial).into()),
+                    crate::motion::menu_enter(),
+                    crate::motion::fade_in,
+                )
+                .into_any_element()
         };
         panels.push(
             deferred(
@@ -2678,8 +2760,7 @@ impl Explorer {
                 }
             }
             let (anchor, x) = (Anchor::TopLeft, px(left));
-            // Slide out from the opening side and fade in; replays when switching submenus.
-            let slide = if right_side { -MENU_SLIDE } else { MENU_SLIDE };
+            // Fades in; replays when switching submenus.
             let path = menu.open[..level]
                 .iter()
                 .map(ToString::to_string)
@@ -2691,14 +2772,14 @@ impl Explorer {
                     panel,
                     ElementId::Name(format!("menu-{}-{path}-leave", menu.serial).into()),
                     0.,
-                    -MENU_SLIDE / 2.,
+                    0.,
                 )
             } else {
                 panel
                     .with_animation(
                         ElementId::Name(format!("menu-{}-{path}", menu.serial).into()),
-                        crate::motion::enter(),
-                        move |panel, t| crate::motion::slide_in(panel, t, slide, 0.),
+                        crate::motion::menu_enter(),
+                        crate::motion::fade_in,
                     )
                     .into_any_element()
             };

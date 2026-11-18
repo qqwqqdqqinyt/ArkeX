@@ -99,8 +99,9 @@ impl Explorer {
     }
 
     /// The fixed-width columns of the Details view or search results in this pane (`None` in the
-    /// grid and the column view, whose rows span the list).
-    pub(super) fn compute_columns(&self) -> Option<layout::Columns> {
+    /// grid and the column view, whose rows span the list). `held_name` keeps an automatic Name
+    /// width as it is (see `before_render`).
+    pub(super) fn compute_columns(&self, held_name: Option<Pixels>) -> Option<layout::Columns> {
         let others: Vec<Pixels> = if self.search_mode {
             vec![
                 theme::COL_LOCATION,
@@ -114,7 +115,7 @@ impl Explorer {
         };
         Some(layout::columns(
             self.pane_width - layout::LIST_CHROME,
-            crate::prefs::user_width(Col::Name),
+            crate::prefs::user_width(Col::Name).or(held_name),
             &others,
         ))
     }
@@ -317,6 +318,7 @@ impl Explorer {
         let label: SharedString = col.label().into_owned().into();
         let cell = div()
             .id(("details-header", col as usize))
+            .debug_selector(move || format!("details-header-{}", col.key()))
             .a11y_column_header(label.clone(), key.map(|(_, ascending)| ascending))
             .flex()
             .h_full()
@@ -417,21 +419,7 @@ impl Explorer {
     /// The width `col` needs for its header and the rows on screen (`None` without rows).
     fn content_width(&self, col: Col, window: &Window) -> Option<Pixels> {
         let measure = |text: &str, size: Pixels, weight: gpui::FontWeight| {
-            if text.is_empty() {
-                return px(0.);
-            }
-            let run = gpui::TextRun {
-                len: text.len(),
-                font: theme::ui_font_at(weight),
-                color: gpui::Hsla::default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_line(SharedString::from(text.to_owned()), size, &[run], None)
-                .width
+            text_width(window, text, size, weight)
         };
         let text_w = |text: &str, size: Pixels| measure(text, size, gpui::FontWeight::NORMAL);
         let widths = if self.search_mode {
@@ -456,7 +444,7 @@ impl Explorer {
 
     /// What comes before the name text in the Name column: the checkbox, the tree's indent and
     /// chevron at `depth`, and the icon, each with its gap.
-    fn name_lead(&self, depth: Option<u16>) -> Pixels {
+    pub(super) fn name_lead(&self, depth: Option<u16>) -> Pixels {
         let mut w = theme::ICON + layout::COL_GAP;
         if self.show_checkboxes && !self.search_mode {
             w += theme::ICON + layout::COL_GAP;
@@ -754,6 +742,30 @@ fn text_cell(col: Col, text: impl Into<SharedString>) -> AnyElement {
         .text_color(theme::text_muted())
         .child(text.into())
         .into_any_element()
+}
+
+/// Width of `text` drawn in the UI font at `size` and `weight`.
+pub(super) fn text_width(
+    window: &Window,
+    text: &str,
+    size: Pixels,
+    weight: gpui::FontWeight,
+) -> Pixels {
+    if text.is_empty() {
+        return px(0.);
+    }
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: theme::ui_font_at(weight),
+        color: gpui::Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(SharedString::from(text.to_owned()), size, &[run], None)
+        .width
 }
 
 /// The extension as written in the name, with its dot (".JPG"); empty for folders and names

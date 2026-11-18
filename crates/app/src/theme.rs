@@ -208,6 +208,33 @@ pub(crate) const SIDEBAR_W: Pixels = px(248.);
 /// How narrow and wide the sidebar can be dragged (Atlas's bounds).
 pub(crate) const SIDEBAR_MIN: Pixels = px(180.);
 pub(crate) const SIDEBAR_MAX: Pixels = px(420.);
+/// Width of the collapsed sidebar: a column of icons (#91).
+pub(crate) const RAIL_W: Pixels = px(52.);
+
+static SIDEBAR_COLLAPSED: AtomicBool = AtomicBool::new(false);
+
+/// Collapses or expands the sidebar. Returns whether it changed; windows must repaint if so.
+pub(crate) fn set_sidebar_collapsed(collapsed: bool) -> bool {
+    let changed = SIDEBAR_COLLAPSED.swap(collapsed, Ordering::Relaxed) != collapsed;
+    if changed {
+        LOOK.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+pub(crate) fn sidebar_collapsed() -> bool {
+    SIDEBAR_COLLAPSED.load(Ordering::Relaxed)
+}
+
+/// The sidebar's width now: the column of icons, or the full sidebar at the width the user
+/// dragged it to.
+pub(crate) fn sidebar_width() -> Pixels {
+    if sidebar_collapsed() {
+        RAIL_W
+    } else {
+        crate::prefs::sidebar_width()
+    }
+}
 pub(crate) const FILTER_W: Pixels = px(220.);
 /// Narrowest the path bar gets on a short path, so it stays an easy click target; the rest of
 /// the title bar drags the window.
@@ -901,6 +928,12 @@ pub(crate) fn frame() -> Rgba {
             0.35
         },
     )
+}
+
+/// The frame's color without Mica's transparency, for what is drawn over the content (the
+/// collapsed sidebar opened on hover), which must hide what is under it.
+pub(crate) fn frame_solid() -> Rgba {
+    mix(ground(), signal(), p().frame_tint)
 }
 
 /// Paper (list, preview): a translucent layer over the material under Mica (like WinUI's Layer), solid surface otherwise.

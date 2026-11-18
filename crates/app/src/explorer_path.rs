@@ -37,6 +37,9 @@ actions!(explorer, [PathUp, PathDown, PathAccept, PathClose]);
 /// Empty space kept at the end of the path bar so there's always somewhere to click to edit the
 /// path (the breadcrumbs collapse before eating into it).
 const PATH_BLANK_MIN: Pixels = px(40.);
+/// How much more readily the levels above the current folder shrink than the current folder
+/// itself, once collapsing levels into "…" isn't enough (a single very long name).
+const CRUMBS_GIVE_WAY: f32 = 1000.;
 /// Max autocomplete entries (the list scrolls, like File Explorer's).
 const MAX_SUGGESTIONS: usize = 500;
 /// Visited folders offered first when their path starts with what's typed (File Explorer's typed
@@ -106,14 +109,16 @@ pub(super) fn list_blocking(
     probe: Option<&dyn arke_core::net::NetProbe>,
     dir: &Path,
 ) -> std::io::Result<Vec<Entry>> {
-    match probe.zip(arke_core::net::share_server(dir)) {
-        Some((probe, server)) => probe
+    if let Some((probe, server)) = probe.zip(arke_core::net::share_server(dir)) {
+        return probe
             .shares(server)
-            .map(|shares| arke_core::net::share_entries(&shares)),
-        None => fs
-            .read_dir(dir)
-            .map(|iter| iter.filter_map(Result::ok).collect()),
+            .map(|shares| arke_core::net::share_entries(&shares));
     }
+    if let Some(Err(err)) = probe.and_then(|probe| probe.reconnect(dir)) {
+        return Err(err);
+    }
+    fs.read_dir(dir)
+        .map(|iter| iter.filter_map(Result::ok).collect())
 }
 
 /// Split input into the folder to list and the name prefix. `C:\Users\Pu` -> (`C:\Users\`, `Pu`).
@@ -600,6 +605,7 @@ impl Explorer {
         .size_full();
         let bar = div()
             .id("path-bar")
+            .debug_selector(|| "path-bar".to_owned())
             .a11y(gpui::Role::Toolbar, t!("a11y.address"))
             .relative()
             .min_w_0()
@@ -767,11 +773,14 @@ impl Explorer {
                     None => more_piece(i, hidden.clone(), cx),
                     Some((label, target)) => crumb_piece(i, label, target, is_last, cx),
                 };
+                // Every level can shrink, so a name too long for the bar truncates instead of
+                // running over what's next to it; the current folder gives way last.
                 div()
+                    .debug_selector(move || format!("crumb-{i}"))
                     .flex()
                     .items_center()
-                    .when(is_last, gpui::Styled::flex_none)
-                    .when(!is_last, gpui::Styled::min_w_0)
+                    .min_w_0()
+                    .flex_shrink(if is_last { 1. } else { CRUMBS_GIVE_WAY })
                     .children(chevron)
                     .child(piece)
                     .into_any_element()
@@ -940,7 +949,8 @@ fn crumb_piece(
         .cursor_pointer()
         .whitespace_nowrap()
         // When space runs out earlier segments truncate first; the current folder truncates last.
-        .when(!is_last, |d| d.min_w_0().truncate())
+        .min_w_0()
+        .truncate()
         .when(is_last, |d| {
             d.text_size(theme::FS_15)
                 .font_weight(theme::FW_STRONG)

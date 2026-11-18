@@ -709,7 +709,9 @@ pub(crate) trait Shell: Send + Sync + 'static {
         Vec::new()
     }
     /// Opens a file with its default program. Background thread (runs shell extensions and other third-party code).
-    fn open(&self, path: &Path) -> Result<(), ShellError>;
+    /// `sort` is the order of the folder view it is opened from: viewers that step through the folder (Photos'
+    /// previous and next) follow it, as when opened from File Explorer. `None` outside a folder view.
+    fn open(&self, path: &Path, sort: Option<arke_core::SortSpec>) -> Result<(), ShellError>;
     /// Expands environment variables such as `%USERPROFILE%` and a leading `~`. Pure.
     fn expand_env(&self, input: &str) -> String;
     /// Local time for display. Pure.
@@ -751,6 +753,13 @@ pub(crate) trait Shell: Send + Sync + 'static {
     ) -> Result<DragOutEnd, ShellError> {
         let _ = (paths, image);
         Ok(DragOutEnd::Finished)
+    }
+    /// Whether another program's window is on top of `owner` at the cursor, such as a launcher
+    /// toolbar or an always-on-top window: a drag over it belongs to Windows drag and drop even
+    /// inside Arke's bounds (#128). UI thread, no file system access.
+    fn covered_at_cursor(&self, owner: Option<isize>) -> bool {
+        let _ = owner;
+        false
     }
     /// Builds the drag image. `base` is an existing thumbnail; falls back to the system icon. Background thread.
     fn drag_image(
@@ -850,6 +859,25 @@ pub(crate) trait Shell: Send + Sync + 'static {
         None
     }
 
+    /// The icon Windows has for files of type `ext` (lowercase, no dot) from the program
+    /// registered for it; `None` when none is registered (the theme icon stays). Reads no file.
+    /// Background thread.
+    fn registered_type_icon(&self, _ext: &str) -> Option<arke_core::thumbs::Thumbnail> {
+        None
+    }
+
+    /// Windows' thumbnail of a video (a frame), fitted within `max_side`, made in a separate
+    /// process. Background thread; may take seconds. `Ok(None)`: the file has none. `Err`: none
+    /// could be asked for (the process can't start), which says nothing about the file.
+    fn video_thumbnail(
+        &self,
+        path: &Path,
+        max_side: u32,
+    ) -> Result<Option<arke_core::thumbs::Thumbnail>, ShellError> {
+        let _ = (path, max_side);
+        Ok(None)
+    }
+
     /// "More options": reads the Windows context menu entries (including third-party shell extensions) for Arke to draw.
     /// With `background`, `paths` is one folder and the menu is its empty-space menu (New, Open in Terminal, ...).
     /// Shell extensions are loaded in a separate process (`shell_host.rs`), never in Arke itself. Background thread.
@@ -871,6 +899,27 @@ pub(crate) trait Shell: Send + Sync + 'static {
     ) -> Result<(), ShellError>;
     /// Releases the menu object when the menu closes without a choice. Fire and forget; UI thread safe.
     fn release_shell_menu(&self, session: u64);
+    /// Context menu extensions that apply to `paths`, or the folder's empty space
+    /// (`win_menu_parts.rs`). Background thread.
+    fn shell_menu_handlers(
+        &self,
+        _paths: &[PathBuf],
+        _background: bool,
+    ) -> Result<Vec<crate::win_menu_parts::MenuHandler>, ShellError> {
+        Ok(Vec::new())
+    }
+    /// One extension's menu, read on its own beside the whole menu, and how long that took.
+    /// `group` is the Arke menu asking: older menus' extension menus are released. Invoked and
+    /// released like [`Shell::shell_menu`]'s. Background thread.
+    fn shell_menu_handler(
+        &self,
+        _paths: &[PathBuf],
+        _background: bool,
+        _handler: &crate::win_menu_parts::MenuHandler,
+        _group: u64,
+    ) -> Result<(ShellMenu, std::time::Duration), ShellError> {
+        Err(ShellError::Unsupported)
+    }
     /// Puts text on the clipboard ("Copy path"). Background thread.
     fn set_clipboard_text(&self, text: &str) -> Result<(), ShellError>;
     /// Opens in Windows Explorer, selecting the item when `select` is set. Background thread.
@@ -919,8 +968,8 @@ pub(crate) trait Shell: Send + Sync + 'static {
         let _ = root;
         Err(ShellError::Unsupported)
     }
-    /// Windows "Open with" dialog. "Always use this app" is remembered by Windows itself.
-    /// Blocks until the dialog closes; background thread.
+    /// Windows "Choose another app" dialog, as Explorer opens it, with "Always" (saved by
+    /// Windows itself, never by Arke). Background thread.
     fn choose_app(&self, path: &Path, owner: Option<isize>) -> Result<(), ShellError> {
         let _ = (path, owner);
         Err(ShellError::Unsupported)
@@ -933,6 +982,12 @@ pub(crate) trait Shell: Send + Sync + 'static {
     /// address bar). The first word is the program (resolved via PATH and App Paths), the rest are arguments. Background thread.
     fn run_in(&self, command_line: &str, dir: &Path) -> Result<(), ShellError> {
         let _ = (command_line, dir);
+        Err(ShellError::Unsupported)
+    }
+    /// Toggles QuickLook's preview of `item` (see `quicklook.rs`): over its pipe when it's running,
+    /// otherwise by starting `exe` (if found) with it. Returns once handed off. Background thread.
+    fn run_quicklook(&self, exe: Option<&Path>, item: &Path) -> Result<(), ShellError> {
+        let _ = (exe, item);
         Err(ShellError::Unsupported)
     }
     /// Local (year, month, day, hour, minute, second), for archive modification times. Pure.

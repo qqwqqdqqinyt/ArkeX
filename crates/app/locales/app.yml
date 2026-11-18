@@ -26,6 +26,22 @@ sidebar.this_pc:
   en: This PC
   zh-TW: 此電腦
   zh-CN: 此电脑
+sidebar.collapse:
+  en: Collapse sidebar
+  zh-TW: 收合側邊欄
+  zh-CN: 收起侧边栏
+sidebar.peek_on:
+  en: Open the sidebar when the pointer rests on it
+  zh-TW: 滑鼠停在側邊欄上時展開
+  zh-CN: 鼠标停在侧边栏上时展开
+sidebar.peek_off:
+  en: Don't open the sidebar when the pointer rests on it
+  zh-TW: 滑鼠停在側邊欄上時不要展開
+  zh-CN: 鼠标停在侧边栏上时不要展开
+sidebar.expand:
+  en: Expand sidebar
+  zh-TW: 展開側邊欄
+  zh-CN: 展开侧边栏
 sidebar.tabs:
   en: Tabs
   zh-TW: 分頁
@@ -80,6 +96,10 @@ drive.removable:
   en: Removable Disk
   zh-TW: 卸除式磁碟
   zh-CN: 可移动磁盘
+drive.floppy:
+  en: Floppy Disk Drive
+  zh-TW: 軟碟機
+  zh-CN: 软盘驱动器
 drive.cdrom:
   en: CD Drive
   zh-TW: 光碟機
@@ -1400,6 +1420,18 @@ settings.preview_desc:
   en: "Shows the selected item on the right; Space for quick look"
   zh-TW: "在右側預覽選取的項目；空白鍵快速預覽"
   zh-CN: "在右侧预览选中的项目；按空格键快速预览"
+settings.space_quicklook:
+  en: Space opens QuickLook
+  zh-TW: 空白鍵開啟 QuickLook
+  zh-CN: 空格键打开 QuickLook
+settings.space_quicklook_tip:
+  en: "Space opens QuickLook (found at %{path}) instead of Arke's quick look"
+  zh-TW: "空白鍵改用 QuickLook（位於 %{path}）預覽，而不是 Arke 的快速預覽"
+  zh-CN: "空格键改用 QuickLook（位于 %{path}）预览，而不是 Arke 的快速预览"
+settings.space_quicklook_tip_running:
+  en: "Space opens the running QuickLook instead of Arke's quick look"
+  zh-TW: "空白鍵改用執行中的 QuickLook 預覽，而不是 Arke 的快速預覽"
+  zh-CN: "空格键改用正在运行的 QuickLook 预览，而不是 Arke 的快速预览"
 settings.startup:
   en: Startup
   zh-TW: 啟動
@@ -1488,6 +1520,10 @@ settings.search_subfolders_desc:
   en: "Typing in the search box searches subfolders too. Off: it filters the current folder. The search panel can still change it each time"
   zh-TW: "在搜尋框輸入時一併搜尋子資料夾；關閉時只篩選目前資料夾。每次仍可在搜尋面板中切換"
   zh-CN: "在搜索框输入时一并搜索子文件夹；关闭时只筛选当前文件夹。每次仍可在搜索面板中切换"
+settings.clear_thumbnail_cache:
+  en: "Clear cache (%{size})"
+  zh-TW: "清除快取（%{size}）"
+  zh-CN: "清除缓存（%{size}）"
 settings.network_thumbnails:
   en: "Thumbnails on network locations"
   zh-TW: "網路位置也顯示縮圖"
@@ -1776,6 +1812,14 @@ error.terminal_failed:
   en: "Couldn't open a terminal: %{error}"
   zh-TW: "無法開啟終端機：%{error}"
   zh-CN: "无法打开终端：%{error}"
+error.quicklook_failed:
+  en: "Couldn't start QuickLook: %{error}"
+  zh-TW: "無法啟動 QuickLook：%{error}"
+  zh-CN: "无法启动 QuickLook：%{error}"
+error.quicklook_not_running:
+  en: "QuickLook isn't running"
+  zh-TW: "QuickLook 未在執行"
+  zh-CN: "QuickLook 未在运行"
 settings.folder_sizes:
   en: "Calculate folder sizes"
   zh-TW: "計算資料夾大小"
@@ -2074,6 +2118,14 @@ menu.move_to_new_folder:
   en: Move to new folder
   zh-TW: 移到新資料夾
   zh-CN: 移到新文件夹
+menu.copy_to_other_pane:
+  en: Copy to other pane
+  zh-TW: 複製到另一個窗格
+  zh-CN: 复制到另一个窗格
+menu.move_to_other_pane:
+  en: Move to other pane
+  zh-TW: 移到另一個窗格
+  zh-CN: 移到另一个窗格
 menu.new_text_file:
   en: New text document
   zh-TW: 新增文字文件
@@ -2222,6 +2274,14 @@ settings.service_desc:
   en: Catches up on changes made while Arke is closed and builds the index faster. Needs administrator approval.
   zh-TW: Arke 關閉期間的變更也能補上，建索引也更快。需要系統管理員同意。
   zh-CN: Arke 关闭期间的更改也能补上，建立索引也更快。需要管理员批准。
+settings.service_outdated:
+  en: "Installed with another version of Arke, so it misses this version's improvements. Update it to match; needs administrator approval."
+  zh-TW: "是用另一個版本的 Arke 安裝的，沒有這個版本的改進。請更新成相同版本；需要系統管理員同意。"
+  zh-CN: "是用另一个版本的 Arke 安装的，没有这个版本的改进。请更新成相同版本；需要管理员批准。"
+settings.service_update:
+  en: Update
+  zh-TW: 更新
+  zh-CN: 更新
 settings.service_install:
   en: Install
   zh-TW: 安裝
@@ -2250,38 +2310,10 @@ settings.search_network_desc:
   en: "Only updated after you open a location, so idle NAS drives aren't woken up"
   zh-TW: "開啟過的位置才會在背景更新，不會喚醒閒置的 NAS"
   zh-CN: "打开过的位置才会在后台更新，不会唤醒闲置的 NAS"
-settings.journal_title:
-  en: "Change journal (NTFS)"
-  zh-TW: "NTFS 變更日誌"
-  zh-CN: "NTFS 更改日志"
-settings.journal_short:
-  en: "How far back Arke can catch up on changes made while it was closed"
-  zh-TW: "決定 Arke 關閉多久之後仍能補上期間的變更"
-  zh-CN: "决定 Arke 关闭多久之后仍能补上期间的更改"
 settings.search_index:
   en: Index
   zh-TW: 索引
   zh-CN: 索引
-settings.advanced:
-  en: Advanced
-  zh-TW: 進階
-  zh-CN: 高级
-settings.journal_desc:
-  en: "Arke uses it to catch up on changes made while it was closed. If it's too small, the index is rebuilt instead. Changing the size needs administrator approval."
-  zh-TW: "Arke 關閉期間的變更從這裡補上；太小時會改為重建索引。調整大小需要系統管理員同意。"
-  zh-CN: "Arke 关闭期间的更改从这里补上；太小时会改为重建索引。调整大小需要管理员批准。"
-settings.journal_now:
-  en: "Up to %{max} MB · %{used} MB used"
-  zh-TW: "上限 %{max} MB · 已用 %{used} MB"
-  zh-CN: "上限 %{max} MB · 已用 %{used} MB"
-settings.journal_busy:
-  en: "Waiting for administrator approval…"
-  zh-TW: "等待系統管理員同意…"
-  zh-CN: "正在等待管理员批准…"
-settings.journal_failed:
-  en: "Couldn't change the size: %{error}"
-  zh-TW: "無法調整大小：%{error}"
-  zh-CN: "无法调整大小：%{error}"
 settings.search_network_auto:
   en: "Add network drives and recently opened shares automatically"
   zh-TW: "自動加入網路磁碟機與最近開啟的共用資料夾"
@@ -4013,6 +4045,10 @@ preview.next_slide:
   en: Next slide
   zh-TW: 下一張投影片
   zh-CN: 下一张幻灯片
+preview.slide_n:
+  en: "Slide %{n}"
+  zh-TW: "第 %{n} 張投影片"
+  zh-CN: "第 %{n} 张幻灯片"
 preview.slide_no_text:
   en: No text on this slide
   zh-TW: 這張投影片沒有文字
@@ -4157,6 +4193,10 @@ preview.zoom_tip:
   en: Switch between fit and actual size (the wheel zooms too)
   zh-TW: 在符合視窗與實際大小間切換（也可用滾輪縮放）
   zh-CN: 在适应窗口与实际大小间切换（也可用滚轮缩放）
+preview.doc_zoom_tip:
+  en: Back to 100% (Ctrl+wheel or Ctrl+= and Ctrl+- zoom)
+  zh-TW: 回到 100%（以 Ctrl+滾輪或 Ctrl+= 與 Ctrl+- 縮放）
+  zh-CN: 回到 100%（以 Ctrl+滚轮或 Ctrl+= 与 Ctrl+- 缩放）
 preview.pages_n_one:
   en: "1 page"
   zh-TW: "%{count} 頁"

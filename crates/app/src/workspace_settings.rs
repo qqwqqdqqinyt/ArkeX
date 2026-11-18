@@ -72,6 +72,9 @@ pub(super) struct SettingsPage {
     pub(super) owner: super::pages::Owner,
     scroll: ScrollHandle,
     scrollbar_drag: ScrollbarDrag,
+    /// The report text box in About › Report a problem, which scrolls inside the page.
+    pub(super) report_scroll: ScrollHandle,
+    pub(super) report_scrollbar: ScrollbarDrag,
     /// Accent hex input (`#RRGGBB`).
     accent_input: Entity<TextInput>,
     _accent_input: Subscription,
@@ -244,6 +247,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // QuickLook may have been started (or quit) since the last check.
+        Self::recheck_quicklook(cx);
         // Already open: switch to that tab.
         let existing = self.settings_panel.as_ref().map(|p| p.owner.clone());
         if self.go_to_page(existing.as_ref(), window, cx) {
@@ -304,6 +309,8 @@ impl Workspace {
             owner,
             scroll: ScrollHandle::new(),
             scrollbar_drag: ScrollbarDrag::default(),
+            report_scroll: ScrollHandle::new(),
+            report_scrollbar: ScrollbarDrag::default(),
             accent_input,
             _accent_input: accent_sub,
             image_input,
@@ -494,6 +501,27 @@ impl Workspace {
             page.category = ix;
         }
         cx.notify();
+    }
+
+    /// Opens a card that expands, by its id.
+    #[cfg(test)]
+    pub(crate) fn expand_settings_card_for_test(
+        &mut self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(page) = &mut self.settings_panel {
+            page.expanded.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Vertical scroll offsets of the settings page and of the report text box.
+    #[cfg(test)]
+    pub(crate) fn settings_scroll_for_test(&self) -> Option<(gpui::Pixels, gpui::Pixels)> {
+        self.settings_panel
+            .as_ref()
+            .map(|p| (p.scroll.offset().y, p.report_scroll.offset().y))
     }
 
     /// Presses Browse on the background image card (`image`) or the Open-with card.
@@ -1134,9 +1162,7 @@ impl Workspace {
                 Icon::Image,
                 t!("settings.show_thumbnails"),
                 Some(t!("settings.show_thumbnails_desc")),
-                switch("show-thumbnails", s.show_thumbnails, |st| {
-                    st.show_thumbnails = !st.show_thumbnails;
-                }),
+                thumbnail_controls(s, cx),
             ),
             card(
                 Icon::Image,
@@ -1198,9 +1224,7 @@ impl Workspace {
                 Icon::Preview,
                 t!("settings.preview"),
                 Some(t!("settings.preview_desc")),
-                switch("preview", s.preview_pane, |st| {
-                    st.preview_pane = !st.preview_pane;
-                }),
+                preview_controls(s),
             ),
             card(
                 Icon::ArrowLeft,
@@ -1469,9 +1493,14 @@ impl Workspace {
         if crate::update::installed_by_setup() {
             startup.remove(0);
         }
-        let search = search_page(s, page, ui, cx);
+        let search = search_page(s, cx);
         let update = super::update_page::update_card(s, page.expanded.contains("update"), ui, cx);
-        let report = super::report_page::report_card(page.expanded.contains("report"), cx);
+        let report = super::report_page::report_card(
+            page.expanded.contains("report"),
+            &page.report_scroll,
+            &page.report_scrollbar,
+            cx,
+        );
         let backup_open = page.expanded.contains("backup");
         let backup =
             super::backup::backup_body(page.backup.as_ref(), &page.import_input, window, cx);
@@ -1566,7 +1595,38 @@ impl Workspace {
         ]
     }
 
+    /// Checks again whether QuickLook is running or installed, in the background, and redraws if
+    /// that changes what Settings offers. Cheap (see `quicklook.rs`), so it runs on every window
+    /// activation.
+    pub(super) fn recheck_quicklook(cx: &mut Context<Self>) {
+        // A thread of its own: the search may set up COM to read shortcuts.
+        let (tx, rx) = flume::bounded(1);
+        crate::explorer::spawn_thread("quicklook-recheck", move || {
+            let _ = tx.send(crate::quicklook::recheck());
+        });
+        cx.spawn(async move |this, cx| {
+            if rx.recv_async().await.unwrap_or(false) {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+    }
+
     /// "Open folder": selects the settings file in Windows Explorer, on a background thread.
+    /// Deletes the thumbnail cache in the background, then redraws (the button goes away).
+    fn clear_thumbnail_cache(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let cleared = cx
+                .background_spawn(async { crate::media::thumb_cache().clear() })
+                .await;
+            if let Err(err) = cleared {
+                log::warn!("clearing the thumbnail cache: {err}");
+            }
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
     fn reveal_settings_file(&self, cx: &mut Context<Self>) {
         let Some(path) = crate::settings::default_path() else {
             return;
@@ -1576,6 +1636,79 @@ impl Workspace {
             let _ = shell.reveal_in_explorer(&path, true);
         });
     }
+}
+
+/// "Show thumbnails": the switch, with "Clear cache (size)" beside it while the cache holds
+/// anything (the size is counted at startup, off the UI thread).
+fn thumbnail_controls(s: &crate::settings::Settings, cx: &mut Context<Workspace>) -> AnyElement {
+    let toggle = switch("show-thumbnails", s.show_thumbnails, |st| {
+        st.show_thumbnails = !st.show_thumbnails;
+    });
+    let Some(bytes) = crate::media::thumb_cache()
+        .counted_disk_bytes()
+        .filter(|&b| b > 0)
+    else {
+        return toggle;
+    };
+    let size = arke_core::format::format_size_base(bytes, s.decimal_sizes);
+    div()
+        .flex()
+        .items_center()
+        .gap(theme::S_12)
+        .child(text_button(
+            "clear-thumbnail-cache",
+            t!("settings.clear_thumbnail_cache", size = size),
+            cx.listener(|_, _: &ClickEvent, _, cx| Workspace::clear_thumbnail_cache(cx)),
+        ))
+        .child(toggle)
+        .into_any_element()
+}
+
+/// The preview pane switch, and when QuickLook (QL-Win) is running or installed, a chip beside it
+/// that hands Space to QuickLook (kept in this row rather than a row of its own).
+fn preview_controls(s: &crate::settings::Settings) -> AnyElement {
+    let toggle = switch("preview", s.preview_pane, |st| {
+        st.preview_pane = !st.preview_pane;
+    });
+    if !crate::quicklook::available() {
+        return toggle;
+    }
+    let on = s.space_quicklook;
+    let tip = SharedString::from(match crate::quicklook::exe() {
+        Some(exe) => t!("settings.space_quicklook_tip", path = exe.display()).into_owned(),
+        None => t!("settings.space_quicklook_tip_running").into_owned(),
+    });
+    let chip = div()
+        .id("space-quicklook")
+        .a11y_toggle(tip.clone(), on)
+        .h(theme::S_24)
+        .px(theme::S_12)
+        .flex()
+        .items_center()
+        .rounded(theme::R_FULL)
+        .border_1()
+        .cursor_pointer()
+        .text_size(theme::FS_12)
+        .tooltip(super::tooltip(tip))
+        .when(on, |d| {
+            d.bg(theme::signal_wash())
+                .border_color(theme::signal_line())
+                .text_color(theme::text())
+        })
+        .when(!on, |d| {
+            d.border_color(theme::line_strong())
+                .text_color(theme::text_subtle())
+                .hover(|s| s.bg(theme::wash()))
+        })
+        .child(t!("settings.space_quicklook").into_owned())
+        .on_click(|_, _, cx| set(cx, |st| st.space_quicklook = !st.space_quicklook));
+    div()
+        .flex()
+        .items_center()
+        .gap(theme::S_12)
+        .child(chip)
+        .child(toggle)
+        .into_any_element()
 }
 
 /// About header: the app mark, the name and the version. The only place the version is shown.
@@ -3316,10 +3449,15 @@ pub(super) fn text_button(
 /// "Live updates" button: installs or removes the background service (UAC prompt); shows text only while waiting.
 /// Same action as the lightning button in the search scope bar, placed here so it is easier to find.
 fn service_control(cx: &App) -> AnyElement {
-    let (installed, busy) = crate::global_search::GlobalSearch::global(cx).map_or_default(|g| {
-        let g = g.read(cx);
-        (g.service_installed == Some(true), g.service_busy)
-    });
+    let (installed, outdated, busy) = crate::global_search::GlobalSearch::global(cx)
+        .map_or_default(|g| {
+            let g = g.read(cx);
+            (
+                g.service_installed == Some(true),
+                g.service_outdated.is_some(),
+                g.service_busy,
+            )
+        });
     if busy {
         return div()
             .text_size(theme::FS_12)
@@ -3327,7 +3465,7 @@ fn service_control(cx: &App) -> AnyElement {
             .child(t!("search.service_busy").to_string())
             .into_any_element();
     }
-    text_button(
+    let toggle = text_button(
         "search-service",
         if installed {
             t!("settings.service_remove")
@@ -3340,21 +3478,50 @@ fn service_control(cx: &App) -> AnyElement {
                 cx.refresh_windows();
             }
         },
-    )
+    );
+    if !(installed && outdated) {
+        return toggle;
+    }
+    // Installing again copies this Arke's program over the service's and keeps its settings.
+    let update = text_button(
+        "search-service-update",
+        t!("settings.service_update"),
+        |_: &ClickEvent, _, cx: &mut App| {
+            if let Some(global) = crate::global_search::GlobalSearch::global(cx) {
+                global.update(cx, |g, cx| g.set_service(true, cx));
+                cx.refresh_windows();
+            }
+        },
+    );
+    div()
+        .flex()
+        .gap(theme::S_8)
+        .child(update)
+        .child(toggle)
+        .into_any_element()
+}
+
+/// The service row's description: what it does, or that it's from another version of Arke.
+fn service_desc(cx: &App) -> Cow<'static, str> {
+    let outdated = crate::global_search::GlobalSearch::global(cx).and_then(|g| {
+        let g = g.read(cx);
+        (g.service_installed == Some(true))
+            .then(|| g.service_outdated.clone())
+            .flatten()
+    });
+    if outdated.is_some() {
+        t!("settings.service_outdated")
+    } else {
+        t!("settings.service_desc")
+    }
 }
 
 /// Above this many indexed items, suggest adding only frequently used subfolders.
 const LARGE_NETWORK_INDEX: usize = 1_000_000;
 
 /// Settings › Search. The whole-PC switch comes first; everything else only matters while it is
-/// on, so it is dimmed and can't be clicked otherwise. The change journal is an advanced detail,
-/// collapsed by default.
-fn search_page(
-    s: &Settings,
-    page: &SettingsPage,
-    ui: &Ui,
-    cx: &mut Context<Workspace>,
-) -> Vec<AnyElement> {
+/// on, so it is dimmed and can't be clicked otherwise.
+fn search_page(s: &Settings, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
     let on = s.global_search;
     let main = group(
         None,
@@ -3391,7 +3558,7 @@ fn search_page(
             card(
                 Icon::Bolt,
                 t!("settings.service"),
-                Some(t!("settings.service_desc")),
+                Some(service_desc(cx)),
                 service_control(cx),
             ),
         ],
@@ -3400,36 +3567,27 @@ fn search_page(
         Some(t!("settings.search_ranking")),
         vec![search_history_card(s, cx)],
     );
-    let drives = crate::win::fixed_drive_roots();
     let scope = group_with(
         Some(t!("settings.search_scope")),
         Some(t!("settings.search_scope_desc")),
-        search_scope_rows(s, drives.clone()),
+        search_scope_rows(s, crate::win::fixed_drive_roots()),
     );
     let network = group_with(
         Some(t!("settings.search_network")),
         Some(t!("settings.search_network_desc")),
         network_search_rows(s, cx),
     );
-    let advanced = group(
-        Some(t!("settings.advanced")),
-        vec![journal_card(
-            drives,
-            page.expanded.contains("search-advanced"),
-            ui,
-            cx,
-        )],
-    );
     let mut out = vec![main];
     out.extend(
-        [index, ranking, scope, network, advanced]
+        [index, ranking, scope, network]
             .into_iter()
             .map(|section| needs(on, section)),
     );
     out
 }
 
-/// A section that only matters while `on`: otherwise dimmed, and a cover takes the clicks.
+/// A section that only matters while `on`: otherwise dimmed, and a cover takes the clicks. The
+/// wheel still goes through, so the page scrolls with the pointer over it.
 fn needs(on: bool, section: AnyElement) -> AnyElement {
     if on {
         return section;
@@ -3443,7 +3601,7 @@ fn needs(on: bool, section: AnyElement) -> AnyElement {
                 .top_0()
                 .left_0()
                 .size_full()
-                .occlude()
+                .block_mouse_except_scroll()
                 .cursor_default(),
         )
         .into_any_element()
@@ -3580,8 +3738,6 @@ macro_rules! drive_ids {
 
 /// Search scope switches, one per drive letter.
 const DRIVE_SWITCH_IDS: [&str; 26] = drive_ids!("search-drive-");
-/// Change journal size dropdowns, one per drive letter.
-const JOURNAL_IDS: [&str; 26] = drive_ids!("journal-size-");
 
 /// The `'static` id for `root`'s drive letter from `ids`.
 fn drive_id(ids: &[&'static str; 26], root: &std::path::Path) -> Option<&'static str> {
@@ -3682,146 +3838,4 @@ fn network_row(
         )
         .child(div().flex_none().child(button))
         .into_any_element()
-}
-
-/// Change journal sizes offered in Settings, in MB. The first is the Windows default.
-const JOURNAL_CHOICES: [u64; 4] = [32, 128, 512, 1024];
-
-fn journal_label(mb: u64) -> String {
-    if mb >= 1024 && mb.is_multiple_of(1024) {
-        format!("{} GB", mb / 1024)
-    } else {
-        format!("{mb} MB")
-    }
-}
-
-/// The offered size `current_mb` counts as (within an eighth, since Windows rounds), or itself.
-fn journal_choice(current_mb: u64) -> u64 {
-    JOURNAL_CHOICES
-        .iter()
-        .copied()
-        .find(|&choice| current_mb.abs_diff(choice) <= choice / 8)
-        .unwrap_or(current_mb)
-}
-
-/// Advanced: the change journal's max size per local disk (queried from the disk), which can be
-/// raised (UAC prompt). A larger journal lets Arke catch up after being closed longer without a
-/// full reindex, at the cost of disk space. Collapsed by default.
-#[allow(
-    clippy::too_many_lines,
-    reason = "One card: a row per disk with its size dropdown, kept together for easier comparison"
-)]
-fn journal_card(
-    roots: Vec<PathBuf>,
-    open: bool,
-    ui: &Ui,
-    cx: &mut Context<Workspace>,
-) -> AnyElement {
-    let state = cx
-        .try_global::<crate::global_search::JournalSizes>()
-        .cloned()
-        .unwrap_or_default();
-    // Loaded even while collapsed: the header shows the current sizes.
-    if !state.loaded {
-        let roots = roots.clone();
-        cx.defer(move |cx| crate::global_search::refresh_journal_sizes(roots, cx));
-    }
-    let mb = |bytes: u64| bytes >> 20;
-    let rows: Vec<AnyElement> = state
-        .drives
-        .iter()
-        .filter_map(|(root, max, used)| {
-            let id = drive_id(&JOURNAL_IDS, root)?;
-            let current = journal_choice(mb(*max));
-            let busy = state.busy.as_ref() == Some(root);
-            let mut options: Vec<(u64, Cow<'static, str>)> = JOURNAL_CHOICES
-                .iter()
-                .map(|&choice| (choice, Cow::Owned(journal_label(choice))))
-                .collect();
-            if !JOURNAL_CHOICES.contains(&current) {
-                options.insert(0, (current, Cow::Owned(journal_label(current))));
-            }
-            let control = if busy {
-                row_desc(t!("settings.journal_busy"))
-            } else {
-                let (root, roots) = (root.clone(), roots.clone());
-                choice_with(
-                    id,
-                    &options,
-                    current,
-                    move |size, cx| {
-                        if size != current {
-                            crate::global_search::set_journal_size(
-                                root.clone(),
-                                size,
-                                roots.clone(),
-                                cx,
-                            );
-                        }
-                    },
-                    None,
-                    ui,
-                )
-            };
-            Some(
-                div()
-                    .min_h(px(48.))
-                    .flex()
-                    .items_center()
-                    .gap(theme::S_16)
-                    .child(row_icon(Icon::Drive, theme::text_muted()))
-                    .child(row_text(
-                        SharedString::from(root.display().to_string()),
-                        Some(row_desc(t!(
-                            "settings.journal_now",
-                            max = mb(*max),
-                            used = mb(*used)
-                        ))),
-                    ))
-                    .child(div().flex_none().child(control))
-                    .into_any_element(),
-            )
-        })
-        .collect();
-    let summary = state
-        .drives
-        .iter()
-        .map(|(root, max, _)| {
-            format!(
-                "{} {}",
-                root.display().to_string().trim_end_matches('\\'),
-                journal_label(journal_choice(mb(*max)))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let error = state.error.map(|e| {
-        div()
-            .text_size(theme::FS_12)
-            .text_color(theme::danger())
-            .child(t!("settings.journal_failed", error = e).into_owned())
-    });
-    let body = div()
-        .flex()
-        .flex_col()
-        .gap(theme::S_8)
-        .child(
-            div()
-                .text_size(theme::FS_12)
-                .text_color(theme::text_subtle())
-                .child(t!("settings.journal_desc").to_string()),
-        )
-        .children(rows)
-        .children(error)
-        .into_any_element();
-    expander(
-        "search-advanced",
-        Icon::Settings,
-        t!("settings.journal_title"),
-        t!("settings.journal_short"),
-        text_summary(summary),
-        open,
-        body,
-        cx,
-    )
 }
